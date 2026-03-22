@@ -1,0 +1,56 @@
+title: LSASS Memory Dump via Suspicious Process Access
+id: a1f3b8c2-9d4e-4f6a-b7c8-1e2d3f4a5b6c
+status: experimental
+level: critical
+description: |
+    Detects suspicious process access to LSASS (lsass.exe) using GrantedAccess
+    flags commonly associated with credential dumping tools like Mimikatz,
+    ProcDump, and comsvcs.dll. LSASS holds plaintext passwords, Kerberos
+    tickets, and NTLM hashes in memory.
+references:
+    - https://attack.mitre.org/techniques/T1003/001/
+    - https://github.com/SigmaHQ/sigma/blob/master/rules/windows/process_access/proc_access_win_lsass_memdump.yml
+author: Kud Lee
+date: 2026/03/19
+tags:
+    - attack.credential_access
+    - attack.t1003.001
+logsource:
+    category: process_access
+    product: windows
+detection:
+    selection:
+        EventID: 10
+        TargetImage|endswith: '\lsass.exe'
+        GrantedAccess:
+            - '0x1010'
+            - '0x1038'
+            - '0x1fffff'
+            - '0x1f0fff'
+            - '0x1f1fff'
+            - '0x143a'
+            - '0x1410'
+            - '0x40'
+    filter_legitimate:
+        SourceImage|endswith:
+            - '\csrss.exe'
+            - '\wininit.exe'
+            - '\wmiprvse.exe'
+            - '\svchost.exe'
+            - '\MsMpEng.exe'
+            - '\SecurityHealthService.exe'
+    filter_system_root:
+        SourceImage|startswith:
+            - 'C:\Windows\System32\'
+            - 'C:\Program Files\'
+            - 'C:\Program Files (x86)\'
+        SourceImage|endswith:
+            - '\csrss.exe'
+            - '\lsass.exe'
+            - '\services.exe'
+    condition: selection and not filter_legitimate and not filter_system_root
+falsepositives:
+    - Legitimate antivirus and EDR products accessing LSASS for protection
+    - Windows Defender performing routine memory scans
+    - WerFault.exe crash dump collection
+    - Legitimate security tools with LSASS monitoring capabilities

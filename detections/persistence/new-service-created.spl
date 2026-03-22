@@ -1,0 +1,120 @@
+# Detection: New Service Installation
+# ATT&CK: T1543.003 — Create or Modify System Process: Windows Service
+# Tactic: Persistence
+# Log Source: Windows System Event ID 7045 (Service Installed)
+# Severity: Medium
+# Description: Detects new Windows service installations via Event ID 7045.
+#   Attackers create malicious services for persistence and privilege escalation.
+#   Services run as SYSTEM by default, making them attractive for maintaining
+#   elevated access. Malicious services often have random names, unusual binary
+#   paths (temp directories, user profiles), or use cmd.exe/powershell.exe as
+#   the service binary. This detection also flags services with suspicious
+#   characteristics such as unsigned binaries or unusual service types.
+# False Positives:
+#   - Legitimate software installations creating services
+#   - Windows Updates installing new services
+#   - IT-deployed management agents (SCCM, Intune, AV products)
+# References:
+#   - https://attack.mitre.org/techniques/T1543/003/
+#   - https://www.sans.org/blog/detecting-malicious-services/
+#
+# Usage: Copy this query into Splunk Search & Reporting
+# Required: Windows System event log forwarding enabled
+#
+# ============================================================================
+# LEARNING NOTES — For SOC Analyst Study
+# ============================================================================
+#
+# LEARNING: WHAT THIS DETECTS AND WHY ATTACKERS DO IT
+#   Windows Services are programs that run in the background, often starting
+#   automatically at boot and running as the SYSTEM account (highest privilege).
+#   Attackers create malicious services for two reasons:
+#   1. PERSISTENCE — The service starts automatically after reboot, maintaining access
+#   2. PRIVILEGE ESCALATION — Services run as SYSTEM by default, giving the attacker
+#      the highest possible privilege level on the machine
+#   Tools like PsExec, Metasploit, and Cobalt Strike all create services as part
+#   of their operation.
+#
+# LEARNING: WHAT HAPPENS TECHNICALLY
+#   1. Attacker runs: sc create EvilSvc binPath= "C:\Temp\payload.exe" start= auto
+#   2. Windows Service Control Manager (SCM) registers the new service
+#   3. Windows logs Event ID 7045 in the System event log
+#   4. On next reboot (or immediately if started), the service runs the malicious binary
+#   Red flags: services running from temp/downloads folders, services using cmd.exe
+#   or PowerShell as the binary, services with random-looking names
+#
+# LEARNING: WHY EVENT ID 7045?
+#   Event ID 7045 fires in the Windows System log whenever a NEW service is installed.
+#   This is different from Event 7036 (service state change) or 4697 (Security log
+#   service install). Event 7045 specifically captures: service name, binary path,
+#   service type, and start type — all the information needed to assess if it is malicious.
+# ============================================================================
+
+# LEARNING: "sourcetype="WinEventLog:System"" — This comes from the Windows System log,
+#   not the Security log. Event 7045 is logged by the Service Control Manager.
+index=wineventlog sourcetype="WinEventLog:System" EventCode=7045
+    ``` Extract service details from the event ```
+| eval event_time=strftime(_time, "%Y-%m-%d %H:%M:%S")
+# LEARNING: "coalesce()" — Different Splunk apps/TAs may extract the same field with different names
+#   coalesce() returns the first non-null value, making the query work regardless of field naming
+| eval service_name=coalesce(ServiceName, Service_Name)
+| eval service_path=coalesce(ImagePath, Service_File_Name)
+| eval service_type=coalesce(ServiceType, Service_Type)
+| eval service_start=coalesce(StartType, Service_Start_Type)
+| eval service_account=coalesce(AccountName, Service_Account)
+    ``` Flag suspicious service binary paths ```
+# LEARNING: This case() evaluates the binary path for red flags:
+#   - Temp/Downloads/AppData = user-writable folders (legitimate software installs to Program Files)
+#   - cmd.exe/powershell.exe as service binary = attacker running commands via service
+#   - .bat/.ps1/.vbs scripts = unusual for real services (they use .exe or .dll)
+| eval suspicious_path=case(
+    match(service_path, "(?i)(\\\\temp\\\\|\\\\tmp\\\\|\\\\appdata\\\\|\\\\users\\\\|\\\\public\\\\|\\\\downloads\\\\)"), "Suspicious - User-writable directory",
+    match(service_path, "(?i)(cmd\.exe|powershell\.exe|pwsh\.exe|mshta\.exe|wscript\.exe|cscript\.exe)"), "Suspicious - Script interpreter as service",
+    match(service_path, "(?i)(\\\\programdata\\\\(?!microsoft))"), "Review - ProgramData non-Microsoft path",
+    match(service_path, "(?i)^(cmd|powershell|net\s|sc\s)"), "Suspicious - Command as service path",
+    match(service_path, "(?i)\.(bat|ps1|vbs|js|hta)(\s|$|\")"), "Suspicious - Script file as service",
+    1=1, "Normal"
+    )
+    ``` Flag suspicious service names (random-looking, very short, or known malicious patterns) ```
+# LEARNING: Service name analysis — attackers often use random names or known tool names:
+#   - Very short names (<=3 chars) are unusual for legitimate services
+#   - 8+ random letters without common words = likely auto-generated by malware
+#   - Names matching known attack tools (psexec, meterpreter, cobalt) = immediate red flag
+| eval suspicious_name=case(
+    len(service_name) <= 3, "Review - Very short service name",
+    match(service_name, "^[a-zA-Z]{8,}$") AND NOT match(service_name, "(?i)(update|service|agent|monitor|helper|driver)"), "Review - Random-looking name",
+    match(service_name, "(?i)(psexec|meterpreter|cobalt|beacon|empire)"), "Critical - Known attack tool",
+    1=1, "Normal"
+    )
+    ``` Combined risk assessment ```
+# LEARNING: Combines path and name analysis into a single risk level for triage
+| eval risk_level=case(
+    suspicious_path="Normal" AND suspicious_name="Normal", "Low",
+    match(suspicious_name, "Critical"), "Critical",
+    match(suspicious_path, "Suspicious"), "High",
+    1=1, "Medium"
+    )
+    ``` Only show notable events (exclude clearly benign) ```
+# LEARNING: "| where risk_level != 'Low'" — Filters out normal service installations
+#   to reduce noise. Only suspicious/malicious services are shown to the analyst.
+| where risk_level != "Low"
+# LEARNING: "| stats ... by Computer, service_name, risk_level" — Groups by host and service
+#   values(service_path) = shows all binary paths associated with this service name
+#   Multiple installs of the same service may indicate persistence re-establishment
+| stats count as install_count
+        values(service_path) as service_binaries
+        values(service_type) as service_types
+        values(service_start) as start_types
+        values(service_account) as accounts
+        values(suspicious_path) as path_analysis
+        values(suspicious_name) as name_analysis
+        earliest(event_time) as first_seen
+        latest(event_time) as last_seen
+    by Computer, service_name, risk_level
+# LEARNING: "| sort - risk_level, - install_count" — Sorts by risk (Critical first),
+#   then by install count (most frequent first) for efficient triage
+| sort - risk_level, - install_count
+# LEARNING: "| table" — Final output for SOC analyst review
+#   Key fields: service_name, service_binaries (what will run), accounts (what privilege level),
+#   path_analysis + name_analysis (why it was flagged)
+| table Computer, service_name, service_binaries, accounts, service_types, start_types, path_analysis, name_analysis, install_count, first_seen, last_seen, risk_level

@@ -1,0 +1,61 @@
+title: Suspicious Registry Run Key Modification
+id: c9f1d6e0-7b2a-4c4d-d5e6-9a0f1b2c3d4e
+status: experimental
+level: medium
+description: |
+    Detects modifications to Windows Registry Run and RunOnce keys, which are
+    classic persistence mechanisms. Programs in these keys execute automatically
+    at user logon or system startup. This rule flags entries pointing to
+    suspicious locations (temp directories, user-writable paths), LOLBin
+    execution patterns, or modifications made by script interpreters.
+references:
+    - https://attack.mitre.org/techniques/T1547/001/
+    - https://docs.microsoft.com/en-us/windows/win32/setupapi/run-and-runonce-registry-keys
+author: Kud Lee
+date: 2026/03/19
+tags:
+    - attack.persistence
+    - attack.t1547.001
+logsource:
+    category: registry_set
+    product: windows
+detection:
+    selection:
+        EventID: 13
+        TargetObject|contains:
+            - '\SOFTWARE\Microsoft\Windows\CurrentVersion\Run\'
+            - '\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce\'
+    filter_trusted_processes:
+        Image|startswith:
+            - 'C:\Program Files\'
+            - 'C:\Program Files (x86)\'
+        Image|endswith:
+            - '\setup.exe'
+            - '\installer.exe'
+            - '\msiexec.exe'
+    suspicious_modifier:
+        Image|endswith:
+            - '\cmd.exe'
+            - '\powershell.exe'
+            - '\pwsh.exe'
+            - '\wscript.exe'
+            - '\cscript.exe'
+            - '\mshta.exe'
+            - '\reg.exe'
+    suspicious_value:
+        Details|contains:
+            - '\Temp\'
+            - '\AppData\Local\Temp\'
+            - '\Public\'
+            - '\Downloads\'
+            - 'powershell'
+            - 'cmd.exe /c'
+            - 'mshta'
+            - 'rundll32'
+            - 'regsvr32'
+            - 'certutil'
+    condition: selection and (suspicious_modifier or suspicious_value) and not filter_trusted_processes
+falsepositives:
+    - Legitimate software registering autostart entries during installation
+    - Windows Updates modifying startup entries
+    - User-installed applications adding themselves to startup

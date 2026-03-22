@@ -1,0 +1,31 @@
+title: Windows Event Log Cleared
+id: f2c4a9b3-0e5d-4f7a-a8b9-2d3c4e5f6a7b
+status: experimental
+level: high
+description: |
+    Detects when Windows event logs are cleared, indicating potential evidence
+    destruction. Event 1102 fires when the Security log is cleared, and Event
+    104 fires when any event log channel is cleared via wevtutil or Event Viewer.
+    Log clearing is highly suspicious in production environments as it typically
+    indicates an attacker covering tracks after malicious activity.
+references:
+    - https://attack.mitre.org/techniques/T1070/001/
+    - https://docs.microsoft.com/en-us/windows/security/threat-protection/auditing/event-1102
+author: Kud Lee
+date: 2026/03/19
+tags:
+    - attack.defense_evasion
+    - attack.t1070.001
+logsource:
+    product: windows
+    service: security
+detection:
+    selection_security:
+        EventID: 1102
+    selection_system:
+        EventID: 104
+    condition: selection_security or selection_system
+falsepositives:
+    - Authorized log maintenance by system administrators during planned maintenance
+    - Automated log rotation scripts (organizations should archive, not clear)
+    - System rebuild or reimaging processes

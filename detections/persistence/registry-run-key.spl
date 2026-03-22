@@ -1,0 +1,135 @@
+# Detection: Registry Run Key Modification
+# ATT&CK: T1547.001 — Boot or Logon Autostart Execution: Registry Run Keys
+# Tactic: Persistence
+# Log Source: Sysmon Event ID 13 (Registry Value Set)
+# Severity: Medium
+# Description: Detects modifications to Windows Registry Run and RunOnce keys,
+#   which are classic persistence mechanisms. Programs listed in these keys
+#   execute automatically when a user logs on or the system starts. Attackers
+#   frequently abuse these keys to maintain persistence across reboots. This
+#   detection monitors both HKLM (machine-wide) and HKCU (user-specific) Run
+#   keys, and flags entries pointing to suspicious locations or using known
+#   LOLBin execution patterns.
+# False Positives:
+#   - Legitimate software registering itself for auto-start
+#   - Windows Updates modifying startup entries
+#   - User-installed applications adding Run key entries
+# References:
+#   - https://attack.mitre.org/techniques/T1547/001/
+#   - https://docs.microsoft.com/en-us/windows/win32/setupapi/run-and-runonce-registry-keys
+#
+# Usage: Copy this query into Splunk Search & Reporting
+# Required: Sysmon installed with Registry monitoring (Event ID 13) enabled
+#
+# ============================================================================
+# LEARNING NOTES — For SOC Analyst Study
+# ============================================================================
+#
+# LEARNING: WHAT THIS DETECTS AND WHY ATTACKERS DO IT
+#   Registry Run keys are one of the oldest and most common persistence mechanisms
+#   in Windows. Any program path written to these registry keys will AUTOMATICALLY
+#   execute every time a user logs in (HKCU) or the system starts (HKLM).
+#   Attackers love this because:
+#   1. It survives reboots — the malware restarts automatically
+#   2. It is simple — just one registry write and persistence is achieved
+#   3. It blends in — many legitimate programs also use Run keys
+#   The two key registry paths are:
+#   - HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run (all users)
+#   - HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run (current user only)
+#
+# LEARNING: WHAT HAPPENS TECHNICALLY
+#   1. Attacker gains access and wants to maintain persistence
+#   2. They run: reg add "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+#      /v "UpdateCheck" /t REG_SZ /d "C:\Users\Public\payload.exe"
+#   3. Or via PowerShell: Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\
+#      CurrentVersion\Run" -Name "UpdateCheck" -Value "C:\Users\Public\payload.exe"
+#   4. Sysmon detects the registry write and logs Event ID 13
+#   5. On next user logon, Windows reads the Run key and launches payload.exe
+#
+# LEARNING: WHY SYSMON EVENT ID 13?
+#   Event ID 13 (RegistryEvent - Value Set) fires when a registry value is written
+#   or modified. Sysmon captures: which process modified the registry (Image),
+#   which registry key was changed (TargetObject), and what value was written (Details).
+#   Native Windows logging does not log individual registry changes with this detail.
+#   This is one of Sysmon's most valuable detection capabilities.
+# ============================================================================
+
+# LEARNING: "EventCode=13" — Sysmon registry value modification events
+index=sysmon EventCode=13
+    ``` Target Run and RunOnce registry keys in both HKLM and HKCU ```
+# LEARNING: "| where match(TargetObject, regex)" — Only keep events modifying Run/RunOnce keys
+#   The regex matches: \Software\Microsoft\Windows\CurrentVersion\Run
+#   and: \Software\Microsoft\Windows\CurrentVersion\RunOnce
+#   RunOnce keys execute once then auto-delete (sometimes used by attackers for one-time actions)
+| where match(TargetObject, "(?i)(\\\\software\\\\microsoft\\\\windows\\\\currentversion\\\\(run|runonce))")
+    ``` Parse the registry key details ```
+| eval event_time=strftime(_time, "%Y-%m-%d %H:%M:%S")
+# LEARNING: "Image" in Sysmon = the process that performed the action
+#   Knowing WHAT process modified the registry is crucial — was it an installer (normal)
+#   or cmd.exe/powershell.exe (suspicious)?
+| eval modifying_process=mvindex(split(Image, "\\"), -1)
+# LEARNING: HKLM = machine-wide (affects all users, requires admin)
+#   HKCU = user-specific (only affects current user, no admin needed)
+#   HKLM modifications are more concerning because they require elevated privileges
+| eval registry_hive=case(
+    match(TargetObject, "(?i)HKLM|HKU\\\\S-1-5-18"), "HKLM (Machine-wide)",
+    match(TargetObject, "(?i)HKU|HKCU"), "HKCU (User-specific)",
+    1=1, "Unknown"
+    )
+    ``` Extract the value name (the autorun entry name) ```
+# LEARNING: "| rex" — Extracts the registry value name (the entry name under the Run key)
+#   From "...\\Run\\EvilUpdater" it captures "EvilUpdater"
+#   Attackers often use innocent-sounding names like "WindowsUpdate" or "SecurityCheck"
+| rex field=TargetObject "(?i)run(?:once)?\\\\(?<entry_name>[^\\\\]+)$"
+    ``` Analyze the registry value (what will auto-execute) ```
+# LEARNING: "Details" is the Sysmon field containing the actual registry value data
+#   This is the PATH of the program that will auto-execute — the most important field
+| eval value_data=Details
+# LEARNING: Analyzing WHAT will be auto-executed for red flags:
+#   - Temp/Downloads directories = malware typically lives in user-writable folders
+#   - Encoded PowerShell (-enc) = obfuscated commands, almost always malicious
+#   - LOLBins (mshta, rundll32, certutil) = legitimate tools abused by attackers
+#   - Script files (.bat, .ps1, .vbs) = unusual for legitimate autostart programs
+| eval suspicious_value=case(
+    match(value_data, "(?i)(\\\\temp\\\\|\\\\tmp\\\\|\\\\appdata\\\\local\\\\temp)"), "High - Temp directory execution",
+    match(value_data, "(?i)(\\\\public\\\\|\\\\downloads\\\\|\\\\desktop\\\\)"), "High - User-writable directory",
+    match(value_data, "(?i)(powershell.*-enc|powershell.*-e\s|powershell.*downloadstring)"), "Critical - Encoded/Download PowerShell",
+    match(value_data, "(?i)(mshta|regsvr32|rundll32|certutil|bitsadmin)"), "High - LOLBin in autorun",
+    match(value_data, "(?i)(cmd\.exe\s*/c|cmd\.exe\s*/k)"), "High - CMD execution in autorun",
+    match(value_data, "(?i)\.(bat|ps1|vbs|js|hta|wsf)"), "Medium - Script in autorun",
+    1=1, "Low - Standard executable"
+    )
+    ``` Flag suspicious modifying processes ```
+# LEARNING: WHO modified the registry matters too — if PowerShell or cmd.exe is writing
+#   to Run keys, that is much more suspicious than an installer (setup.exe) doing it
+| eval suspicious_modifier=case(
+    match(Image, "(?i)(cmd\.exe|powershell\.exe|pwsh\.exe|wscript\.exe|cscript\.exe|mshta\.exe)"), "High - Script engine modified registry",
+    match(Image, "(?i)(reg\.exe)"), "Medium - reg.exe used to modify Run key",
+    1=1, "Low - Standard process"
+    )
+# LEARNING: "| where" — Only show results where EITHER the value or the modifier is suspicious
+#   This filters out noise from legitimate software adding normal Run key entries
+| where suspicious_value != "Low - Standard executable" OR suspicious_modifier != "Low - Standard process"
+| eval overall_risk=case(
+    match(suspicious_value, "Critical"), "Critical",
+    match(suspicious_value, "High") OR match(suspicious_modifier, "High"), "High",
+    1=1, "Medium"
+    )
+# LEARNING: "| stats ... by Computer, User, overall_risk" — Groups all modifications per user per host
+#   values(autorun_entries) = names of all Run key entries added
+#   values(autorun_targets) = paths of all programs set to auto-execute
+| stats count as modification_count
+        values(entry_name) as autorun_entries
+        values(value_data) as autorun_targets
+        values(modifying_process) as modifying_processes
+        values(registry_hive) as hive
+        values(suspicious_value) as value_analysis
+        values(suspicious_modifier) as modifier_analysis
+        earliest(event_time) as first_seen
+        latest(event_time) as last_seen
+    by Computer, User, overall_risk
+| sort - overall_risk, - modification_count
+# LEARNING: "| table" — Final output for SOC triage
+#   Key fields: autorun_entries (what was named), autorun_targets (what will execute),
+#   modifying_processes (what wrote the key), value_analysis + modifier_analysis (why flagged)
+| table Computer, User, hive, autorun_entries, autorun_targets, modifying_processes, value_analysis, modifier_analysis, modification_count, first_seen, last_seen, overall_risk

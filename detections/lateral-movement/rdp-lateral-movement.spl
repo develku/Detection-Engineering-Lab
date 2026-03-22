@@ -1,0 +1,114 @@
+# Detection: Suspicious RDP Lateral Movement
+# ATT&CK: T1021.001 — Remote Services: Remote Desktop Protocol
+# Tactic: Lateral Movement
+# Log Source: Windows Security Event ID 4624 (Logon), Event ID 4625 (Failed Logon)
+# Severity: High
+# Description: Detects suspicious Remote Desktop Protocol (RDP) lateral movement
+#   by identifying Type 10 (RemoteInteractive) logon events where a single source
+#   connects to multiple internal hosts in a short time window. This pattern is
+#   consistent with an attacker pivoting through the network using compromised
+#   credentials. Also detects RDP from unusual source IPs and after-hours
+#   connections that deviate from baseline behavior.
+# False Positives:
+#   - IT administrators performing maintenance across multiple servers
+#   - Jump/bastion hosts used for legitimate multi-host management
+#   - Automated monitoring tools using RDP health checks
+# References:
+#   - https://attack.mitre.org/techniques/T1021/001/
+#   - https://jpcertcc.github.io/ToolAnalysisResultSheet/details/mstsc.htm
+#
+# Usage: Copy this query into Splunk Search & Reporting
+# Required: Windows Security audit policy — Audit Logon/Logoff enabled
+#
+# ============================================================================
+# LEARNING NOTES — For SOC Analyst Study
+# ============================================================================
+#
+# LEARNING: WHAT THIS DETECTS AND WHY ATTACKERS DO IT
+#   This detects lateral movement via RDP (Remote Desktop Protocol). After
+#   compromising initial credentials, attackers use RDP to "pivot" — connecting
+#   from one compromised machine to the next across the network. RDP is
+#   attractive to attackers because it provides a full GUI desktop session,
+#   it is commonly allowed through firewalls (port 3389), and it looks like
+#   normal admin activity. The key behavioral indicator is a SINGLE source IP
+#   connecting to MULTIPLE internal hosts in a short time period.
+#
+# LEARNING: WHAT HAPPENS TECHNICALLY
+#   1. Attacker compromises credentials (password, hash, or ticket)
+#   2. From their foothold machine, they RDP to another internal server
+#   3. They repeat, RDP-ing from server to server ("island hopping")
+#   4. Each RDP connection generates a Windows Security Event 4624 with Logon_Type=10
+#   5. The pattern of one IP → many hosts in a short window reveals the pivoting
+#
+# LEARNING: WHY EVENT ID 4624 WITH LOGON_TYPE=10?
+#   Event 4624 is the "successful logon" event. The Logon_Type field tells you HOW
+#   the user logged in. Type 10 specifically means "RemoteInteractive" which is RDP.
+#   Other types: Type 2 = console, Type 3 = network (file share), Type 7 = unlock.
+#   By filtering for Type 10, we isolate only RDP sessions and ignore other logon types.
+# ============================================================================
+
+# LEARNING: Search Windows Security logs for successful logons (4624) that are RDP (Type 10)
+index=wineventlog sourcetype="WinEventLog:Security" EventCode=4624 Logon_Type=10
+    ``` Type 10 = RemoteInteractive (RDP) logon ```
+| eval event_time=strftime(_time, "%Y-%m-%d %H:%M:%S")
+# LEARNING: Extract just the hour (0-23) to determine if this happened during business hours
+#   strftime(%H) returns the hour in 24-hour format — used for after-hours detection
+| eval hour_of_day=strftime(_time, "%H")
+# LEARNING: Flag sessions outside business hours (before 7 AM or after 7 PM)
+#   After-hours RDP is more suspicious because legitimate admins typically work 9-5
+| eval is_after_hours=if(hour_of_day < 7 OR hour_of_day > 19, 1, 0)
+    ``` Extract source IP — handle different field names ```
+# LEARNING: "coalesce()" — Returns the first non-null value from a list of fields
+#   Different Windows versions/configs may log the source IP in different field names
+#   coalesce() handles all variants so the query works regardless of field naming
+| eval source_ip=coalesce(IpAddress, Source_Network_Address, src_ip)
+    ``` Filter out local and null sources ```
+# LEARNING: Exclude localhost and null IPs — local RDP is not lateral movement
+| where isnotnull(source_ip) AND source_ip != "-" AND source_ip != "127.0.0.1" AND source_ip != "::1"
+    ``` Aggregate RDP sessions per source to detect multi-host pivoting ```
+# LEARNING: "| stats ... by source_ip" — Groups ALL RDP sessions by source IP address
+#   dc(Computer) = "distinct count" — how many DIFFERENT target hosts this IP connected to
+#   This is the core detection logic: one IP → many targets = lateral movement pattern
+#   values(Computer) = list of all target hostnames (shows the attack path)
+#   sum(is_after_hours) = count of sessions that happened outside business hours
+#   dc(TargetUserName) = how many different accounts were used (multiple = credential abuse)
+| stats dc(Computer) as unique_targets
+        values(Computer) as target_hosts
+        count as rdp_session_count
+        sum(is_after_hours) as after_hours_sessions
+        earliest(event_time) as first_connection
+        latest(event_time) as last_connection
+        values(TargetUserName) as accounts_used
+        dc(TargetUserName) as unique_accounts
+    by source_ip
+    ``` Flag sources connecting to 3+ hosts (indicative of lateral movement) ```
+# LEARNING: "| where unique_targets >= 3" — Only alert when an IP connected to 3 or more hosts
+#   This threshold filters out normal admin behavior (1-2 hosts) and focuses on pivoting patterns
+| where unique_targets >= 3
+    ``` Risk scoring based on multiple factors ```
+# LEARNING: Numeric risk scoring — builds a composite score from multiple indicators
+#   Each unique target adds 10 points (more hosts = more suspicious)
+#   Each after-hours session adds 15 points (unusual timing)
+#   Using multiple accounts adds 20 points (credential compromise indicator)
+| eval risk_score=0
+| eval risk_score=risk_score + (unique_targets * 10)
+| eval risk_score=risk_score + (after_hours_sessions * 15)
+| eval risk_score=risk_score + if(unique_accounts > 1, 20, 0)
+| eval risk_level=case(
+    risk_score >= 80, "Critical",
+    risk_score >= 50, "High",
+    risk_score >= 30, "Medium",
+    1=1, "Low"
+    )
+# LEARNING: Human-readable summary of what triggered the alert
+| eval indicator_summary=case(
+    unique_targets >= 5 AND after_hours_sessions > 0, "Multi-host RDP pivot during off-hours",
+    unique_targets >= 5, "Rapid multi-host RDP lateral movement",
+    unique_accounts > 1, "Multiple accounts used for RDP from same source",
+    1=1, "RDP to multiple hosts from single source"
+    )
+| sort - risk_score
+# LEARNING: "| table" — Final output for SOC triage
+#   Key fields: source_ip (attacker's pivot point), target_hosts (attack path through network),
+#   accounts_used (compromised credentials), after_hours_sessions (anomalous timing)
+| table source_ip, accounts_used, unique_accounts, unique_targets, target_hosts, rdp_session_count, after_hours_sessions, first_connection, last_connection, risk_level, indicator_summary

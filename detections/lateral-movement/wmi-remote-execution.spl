@@ -1,0 +1,135 @@
+# Detection: WMI Remote Execution
+# ATT&CK: T1047 — Windows Management Instrumentation
+# Tactic: Lateral Movement / Execution
+# Log Source: Sysmon Event ID 1 (Process Creation)
+# Severity: High
+# Description: Detects remote process execution via Windows Management
+#   Instrumentation (WMI). Attackers abuse WMI to execute commands on remote
+#   systems using wmic.exe, wmiprvse.exe, or PowerShell's Invoke-WmiMethod.
+#   WMI-based lateral movement is stealthy because it uses built-in Windows
+#   functionality and may not trigger traditional AV signatures. Key indicators
+#   include wmiprvse.exe spawning suspicious child processes (cmd.exe,
+#   powershell.exe) or wmic.exe with /node: parameter targeting remote hosts.
+# False Positives:
+#   - SCCM/ConfigMgr using WMI for system inventory and management
+#   - Monitoring tools querying WMI for system health data
+#   - Legitimate PowerShell scripts using Get-WmiObject for administration
+# References:
+#   - https://attack.mitre.org/techniques/T1047/
+#   - https://www.fireeye.com/blog/threat-research/2017/03/wmimplant_a_wmi_ba.html
+#
+# Usage: Copy this query into Splunk Search & Reporting
+# Required: Sysmon installed with Process Creation logging (Event ID 1) enabled
+#
+# ============================================================================
+# LEARNING NOTES — For SOC Analyst Study
+# ============================================================================
+#
+# LEARNING: WHAT THIS DETECTS AND WHY ATTACKERS DO IT
+#   WMI (Windows Management Instrumentation) is a built-in Windows management
+#   framework. Attackers abuse it for lateral movement because:
+#   1. It is present on EVERY Windows system (no tools to upload)
+#   2. It uses legitimate Windows infrastructure (hard to distinguish from admin activity)
+#   3. It does not drop files on disk by default (fileless execution)
+#   4. Traditional AV often does not flag WMI commands
+#   Common attack tools: wmic.exe with /node: flag, PowerShell's Invoke-WmiMethod,
+#   or Impacket's wmiexec.py from Linux.
+#
+# LEARNING: WHAT HAPPENS TECHNICALLY
+#   WMI remote execution has three common patterns:
+#   1. WMIC: "wmic /node:TARGET process call create 'cmd.exe /c whoami'"
+#      → Connects to TARGET over DCOM (port 135) and creates a process
+#   2. PowerShell: "Invoke-WmiMethod -Computer TARGET -Class Win32_Process -Name Create"
+#      → Same mechanism through PowerShell cmdlets
+#   3. On the TARGET side, wmiprvse.exe (WMI Provider Host) spawns the attacker's command
+#      → cmd.exe or powershell.exe appearing as a child of wmiprvse.exe = remote execution
+#
+# LEARNING: WHY SYSMON EVENT ID 1?
+#   Process creation events capture both sides of WMI remote execution:
+#   - SOURCE side: wmic.exe or powershell.exe with remote execution parameters
+#   - TARGET side: wmiprvse.exe spawning suspicious child processes
+#   The parent-child process relationship (wmiprvse.exe → cmd.exe) is the key indicator
+#   that a command was received remotely via WMI, not executed locally.
+# ============================================================================
+
+# LEARNING: Three search conditions combined with OR to catch all WMI variants
+index=sysmon EventCode=1
+    (
+    ``` Detect wmiprvse.exe spawning suspicious child processes (remote execution indicator) ```
+    # LEARNING: This catches the TARGET side — when a remote WMI command arrives,
+    #   wmiprvse.exe (WMI Provider Host) spawns a child process to run the command.
+    #   Normal wmiprvse.exe children are WMI provider DLLs, NOT cmd.exe/powershell.exe.
+    #   The list includes common LOLBins (Living Off the Land Binaries) that attackers use.
+    (ParentImage="*\\wmiprvse.exe"
+        AND (Image="*\\cmd.exe"
+            OR Image="*\\powershell.exe"
+            OR Image="*\\pwsh.exe"
+            OR Image="*\\mshta.exe"
+            OR Image="*\\cscript.exe"
+            OR Image="*\\wscript.exe"
+            OR Image="*\\rundll32.exe"
+            OR Image="*\\regsvr32.exe"
+            OR Image="*\\certutil.exe"
+            OR Image="*\\bitsadmin.exe"))
+    OR
+    ``` Detect wmic.exe targeting remote hosts ```
+    # LEARNING: This catches the SOURCE side — wmic.exe with /node: parameter
+    #   means it is targeting a REMOTE host. Without /node:, wmic runs locally (less suspicious).
+    (Image="*\\wmic.exe"
+        AND (CommandLine="*/node:*" OR CommandLine="*/NODE:*"))
+    OR
+    ``` Detect PowerShell WMI remote execution cmdlets ```
+    # LEARNING: PowerShell-based WMI execution — same effect as wmic but through PS cmdlets
+    #   Win32_Process Create = creating a new process on a remote system via WMI class
+    (Image="*\\powershell.exe"
+        AND (CommandLine="*Invoke-WmiMethod*"
+            OR CommandLine="*Invoke-CimMethod*"
+            OR CommandLine="*Win32_Process*Create*"
+            OR CommandLine="*wmiclass*"))
+    )
+| eval process_name=mvindex(split(Image, "\\"), -1)
+| eval parent_process=mvindex(split(ParentImage, "\\"), -1)
+| eval event_time=strftime(_time, "%Y-%m-%d %H:%M:%S")
+    ``` Extract remote target from wmic /node: parameter ```
+# LEARNING: "| rex" — Regex extraction to pull out the target hostname/IP from the command
+#   "/node: SERVER01" → remote_target = "SERVER01"
+#   This shows which systems the attacker is targeting
+| rex field=CommandLine "(?i)/node:\s*[\"']?(?<remote_target>[^\s\"']+)"
+    ``` Classify the WMI execution variant ```
+# LEARNING: Labels each event with the specific WMI technique for easier analyst understanding
+| eval wmi_technique=case(
+    match(ParentImage, "(?i)wmiprvse\.exe"), "WMI Provider Host spawned child process",
+    match(CommandLine, "(?i)/node:"), "WMIC remote execution via /node:",
+    match(CommandLine, "(?i)invoke-wmimethod"), "PowerShell Invoke-WmiMethod",
+    match(CommandLine, "(?i)invoke-cimmethod"), "PowerShell Invoke-CimMethod",
+    match(CommandLine, "(?i)win32_process.*create"), "WMI Win32_Process Create",
+    1=1, "WMI-related execution"
+    )
+# LEARNING: "| stats ... by Computer, process_name" — Aggregates WMI activity per host
+#   dc(remote_target) = distinct count of unique remote targets (multiple = lateral movement)
+#   values(remote_target) = list of all targeted hosts
+| stats count as execution_count
+        values(CommandLine) as commands
+        values(parent_process) as parent_processes
+        values(User) as users
+        values(wmi_technique) as technique_variant
+        values(remote_target) as remote_targets
+        dc(remote_target) as unique_remote_targets
+        earliest(event_time) as first_seen
+        latest(event_time) as last_seen
+    by Computer, process_name
+# LEARNING: Risk assessment based on behavior patterns:
+#   >3 remote targets = attacker is sweeping the network via WMI
+#   download/iex/encoded in commands = likely payload delivery (downloading malware)
+#   whoami/net/ipconfig = reconnaissance commands (attacker mapping the environment)
+| eval risk_level=case(
+    unique_remote_targets > 3, "Critical - Multi-host WMI lateral movement",
+    match(commands, "(?i)(download|invoke-expression|iex|encoded)"), "Critical - Suspicious WMI payload",
+    match(commands, "(?i)(whoami|net\s|ipconfig|systeminfo)"), "High - Reconnaissance via WMI",
+    1=1, "High - WMI remote execution detected"
+    )
+| sort - execution_count
+# LEARNING: "| table" — Final output for analyst review
+#   Key fields: technique_variant (how WMI was used), remote_targets (what was targeted),
+#   commands (what was executed), risk_level (triage priority)
+| table Computer, process_name, parent_processes, users, technique_variant, remote_targets, commands, execution_count, first_seen, last_seen, risk_level

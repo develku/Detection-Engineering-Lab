@@ -1,0 +1,40 @@
+title: PsExec Remote Execution Detection
+id: e5b7f2a6-3d8c-4e0f-f1a2-5c6b7d8e9f0a
+status: experimental
+level: high
+description: |
+    Detects PsExec remote execution by identifying PSEXESVC.exe service binary
+    creation and child processes spawned from it. PsExec is a Sysinternals tool
+    commonly abused by attackers and ransomware operators for lateral movement.
+    It copies PSEXESVC.exe to the ADMIN$ share, creates a service, and executes
+    commands remotely on target systems.
+references:
+    - https://attack.mitre.org/techniques/T1570/
+    - https://docs.microsoft.com/en-us/sysinternals/downloads/psexec
+author: Kud Lee
+date: 2026/03/19
+tags:
+    - attack.lateral_movement
+    - attack.t1570
+    - attack.execution
+logsource:
+    category: process_creation
+    product: windows
+detection:
+    selection_psexec_service:
+        EventID: 1
+        Image|endswith: '\PSEXESVC.exe'
+    selection_psexec_binary:
+        EventID: 1
+        Image|endswith:
+            - '\psexec.exe'
+            - '\psexec64.exe'
+        CommandLine|contains: '\\'
+    selection_psexec_child:
+        EventID: 1
+        ParentImage|endswith: '\PSEXESVC.exe'
+    condition: selection_psexec_service or selection_psexec_binary or selection_psexec_child
+falsepositives:
+    - Legitimate system administration using PsExec for remote management
+    - Software deployment tools and SCCM operations
+    - IT helpdesk remote support activities

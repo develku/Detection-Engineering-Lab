@@ -1,0 +1,75 @@
+title: Process Injection via CreateRemoteThread
+id: a3d5b0c4-1f6e-4a8b-b9c0-3e4d5f6a7b8c
+status: experimental
+level: high
+description: |
+    Detects process injection via the CreateRemoteThread API (Sysmon Event 8).
+    Process injection enables attackers to execute code in another process's
+    address space for defense evasion (hiding in legitimate processes), privilege
+    escalation (injecting into SYSTEM processes), and credential access (injecting
+    into LSASS). This rule excludes known legitimate sources of remote thread
+    creation to reduce false positives.
+references:
+    - https://attack.mitre.org/techniques/T1055/
+    - https://www.elastic.co/blog/ten-process-injection-techniques
+author: Kud Lee
+date: 2026/03/19
+tags:
+    - attack.defense_evasion
+    - attack.privilege_escalation
+    - attack.t1055
+logsource:
+    category: create_remote_thread
+    product: windows
+detection:
+    selection:
+        EventID: 8
+    filter_system_processes:
+        SourceImage|endswith:
+            - '\csrss.exe'
+            - '\wininit.exe'
+            - '\services.exe'
+            - '\smss.exe'
+            - '\lsass.exe'
+            - '\winlogon.exe'
+            - '\svchost.exe'
+    filter_av_edr:
+        SourceImage|endswith:
+            - '\MsMpEng.exe'
+            - '\MsSense.exe'
+            - '\SenseIR.exe'
+            - '\SecurityHealthService.exe'
+    filter_visual_studio:
+        SourceImage|contains:
+            - '\devenv.exe'
+            - '\msvsmon.exe'
+    suspicious_target:
+        TargetImage|endswith:
+            - '\lsass.exe'
+            - '\winlogon.exe'
+            - '\csrss.exe'
+            - '\services.exe'
+            - '\svchost.exe'
+            - '\explorer.exe'
+    suspicious_source_path:
+        SourceImage|contains:
+            - '\Temp\'
+            - '\tmp\'
+            - '\AppData\'
+            - '\Public\'
+            - '\Downloads\'
+    suspicious_source_lolbin:
+        SourceImage|endswith:
+            - '\powershell.exe'
+            - '\pwsh.exe'
+            - '\cmd.exe'
+            - '\wscript.exe'
+            - '\cscript.exe'
+            - '\mshta.exe'
+            - '\rundll32.exe'
+    condition: selection and not filter_system_processes and not filter_av_edr and not filter_visual_studio and (suspicious_target or suspicious_source_path or suspicious_source_lolbin)
+falsepositives:
+    - Antivirus and EDR products injecting monitoring DLLs into processes
+    - Application compatibility shim engine
+    - Debugging tools and profilers (Visual Studio, WinDbg)
+    - Some legitimate software using cross-process communication

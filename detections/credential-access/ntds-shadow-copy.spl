@@ -1,0 +1,118 @@
+# Detection: NTDS.dit Extraction via Shadow Copy
+# ATT&CK: T1003.003 — OS Credential Dumping: NTDS
+# Tactic: Credential Access
+# Log Source: Sysmon Event ID 1 (Process Creation)
+# Severity: Critical
+# Description: Detects attempts to create Volume Shadow Copies for the purpose
+#   of extracting the NTDS.dit file. The NTDS.dit database is the Active
+#   Directory database that stores all password hashes, Kerberos keys, and
+#   credential material for every domain account. Attackers create shadow copies
+#   using vssadmin, wmic, or ntdsutil to access the locked NTDS.dit file and
+#   extract it offline. This is often combined with extraction of the SYSTEM
+#   registry hive for decryption.
+# False Positives:
+#   - Legitimate backup operations using VSS on domain controllers
+#   - Windows Server Backup scheduled tasks
+#   - System state backups performed by authorized administrators
+# References:
+#   - https://attack.mitre.org/techniques/T1003/003/
+#   - https://www.ired.team/offensive-security/credential-access-and-credential-dumping/ntds.dit-enumeration
+#
+# Usage: Copy this query into Splunk Search & Reporting
+# Required: Sysmon installed with Process Creation logging (Event ID 1) enabled
+#
+# ============================================================================
+# LEARNING NOTES — For SOC Analyst Study
+# ============================================================================
+#
+# LEARNING: WHAT THIS DETECTS AND WHY ATTACKERS DO IT
+#   NTDS.dit is the Active Directory database file stored on every Domain Controller.
+#   It contains password hashes for EVERY account in the domain. If an attacker
+#   can steal this file, they can crack all passwords offline at their leisure.
+#   The problem is that NTDS.dit is constantly locked by the AD service, so it
+#   cannot be simply copied. Attackers use Volume Shadow Copy Service (VSS) to
+#   create a snapshot of the disk, then copy NTDS.dit from the shadow copy.
+#
+# LEARNING: WHAT HAPPENS TECHNICALLY
+#   1. Attacker gains access to a Domain Controller (already has high privileges)
+#   2. They create a Volume Shadow Copy: "vssadmin create shadow /for=C:"
+#   3. This creates a read-only snapshot of the C: drive at that moment in time
+#   4. They copy NTDS.dit from the shadow copy path:
+#      copy \\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1\Windows\NTDS\ntds.dit C:\temp\
+#   5. They also need the SYSTEM registry hive (contains the boot key to decrypt NTDS.dit):
+#      reg save HKLM\SYSTEM C:\temp\SYSTEM
+#   6. Offline, they use tools like secretsdump.py to extract all password hashes
+#   Alternative methods: ntdsutil "IFM" (Install From Media) or wmic shadowcopy
+#
+# LEARNING: WHY SYSMON EVENT ID 1?
+#   Event ID 1 captures every new process and its command line arguments.
+#   We detect the attack by looking for the specific commands (vssadmin, wmic,
+#   ntdsutil, copy/esentutl) that are used to create shadow copies and copy NTDS.dit.
+#   The command line tells us exactly what the attacker is trying to do.
+# ============================================================================
+
+# LEARNING: Search all Sysmon process creation events
+index=sysmon EventCode=1
+# LEARNING: "lower(CommandLine)" — Converts entire command line to lowercase for case-insensitive matching
+| eval lower_cmd=lower(CommandLine)
+    ``` Detect vssadmin shadow copy creation ```
+# LEARNING: Each "is_*" flag checks for a different tool/technique that creates shadow copies
+#   "vssadmin create shadow" — The most common method, using the built-in VSS admin tool
+| eval is_vssadmin=if(
+    match(lower_cmd, "vssadmin.*create\s+shadow") OR match(lower_cmd, "vssadmin.*shadow.*\/for=c:"),
+    1, 0)
+    ``` Detect wmic shadow copy creation ```
+# LEARNING: "wmic shadowcopy call create" — Alternative method using WMI command line
+| eval is_wmic=if(
+    match(lower_cmd, "wmic.*shadowcopy.*call.*create") OR match(lower_cmd, "wmic.*shadow.*copy"),
+    1, 0)
+    ``` Detect ntdsutil invocation for IFM (Install From Media) or snapshot ```
+# LEARNING: ntdsutil is a legitimate AD admin tool; "ifm" mode creates an installable copy
+#   of AD data (including NTDS.dit) — originally designed for deploying new DCs
+| eval is_ntdsutil=if(
+    match(lower_cmd, "ntdsutil.*ifm") OR match(lower_cmd, "ntdsutil.*snapshot") OR match(lower_cmd, "ntdsutil.*\"activate instance ntds\""),
+    1, 0)
+    ``` Detect direct copy of ntds.dit from shadow copy path ```
+# LEARNING: This catches the actual exfiltration step — copying ntds.dit from the shadow copy
+#   "\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy" is the path to shadow copy files
+#   "esentutl" is a database utility that can also extract the locked database
+| eval is_ntds_copy=if(
+    match(lower_cmd, "copy.*\\\\\\?\\\\globalroot\\\\device\\\\harddiskvolumeshadowcopy.*ntds") OR
+    match(lower_cmd, "copy.*ntds\\.dit") OR
+    match(lower_cmd, "esentutl.*ntds"),
+    1, 0)
+    ``` Filter for only relevant events ```
+# LEARNING: "| where" — Only keep events where at least one technique flag is true
+#   This filters out the millions of other process creation events
+| where is_vssadmin=1 OR is_wmic=1 OR is_ntdsutil=1 OR is_ntds_copy=1
+    ``` Classify the technique used ```
+# LEARNING: "case()" — Labels each event with the technique name for analyst readability
+#   Order matters in case() — first match wins, so "Direct Copy" is checked first
+#   as it's the most critical (means shadow copy already exists)
+| eval technique=case(
+    is_ntds_copy=1, "Direct NTDS.dit Copy",
+    is_ntdsutil=1, "ntdsutil IFM/Snapshot",
+    is_vssadmin=1, "vssadmin Shadow Copy",
+    is_wmic=1, "WMIC Shadow Copy",
+    1=1, "Unknown"
+    )
+# LEARNING: Extract just filenames from full paths for cleaner output
+| eval parent_process=mvindex(split(ParentImage, "\\"), -1)
+| eval process_name=mvindex(split(Image, "\\"), -1)
+| eval event_time=strftime(_time, "%Y-%m-%d %H:%M:%S")
+# LEARNING: "| stats ... by Computer, process_name" — Groups events per host and process
+#   values(technique) — Shows all different extraction techniques used (multiple = organized attack)
+#   values(CommandLine) — Preserves the exact commands for forensic review
+| stats count as execution_count
+        values(technique) as techniques_used
+        values(CommandLine) as commands
+        values(parent_process) as parent_processes
+        values(User) as users
+        earliest(event_time) as first_seen
+        latest(event_time) as last_seen
+    by Computer, process_name
+| sort - execution_count
+# LEARNING: "| table" — Final output for the analyst
+#   Look for: techniques_used (shadow copy + direct copy together = complete attack chain)
+#   commands shows exactly what was run for incident response investigation
+| table Computer, process_name, parent_processes, users, techniques_used, commands, execution_count, first_seen, last_seen

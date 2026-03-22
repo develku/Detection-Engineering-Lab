@@ -1,0 +1,128 @@
+# Detection: Member Added to Administrative Group
+# ATT&CK: T1078.002 — Valid Accounts: Domain Accounts
+# Tactic: Privilege Escalation
+# Log Source: Windows Security Events 4728, 4732, 4756
+# Severity: High
+# Description: Detects when a member is added to a privileged security group
+#   (Domain Admins, Enterprise Admins, Administrators, Schema Admins, etc.).
+#   Attackers add compromised accounts to admin groups to escalate privileges
+#   and gain persistent elevated access. This is a critical indicator because
+#   admin group changes are infrequent in most environments and should always
+#   be investigated. Event 4728 = global group, 4732 = local group,
+#   4756 = universal group.
+# False Positives:
+#   - Authorized IT personnel adding users to admin groups (change management)
+#   - New employee onboarding with administrative role requirements
+#   - Service account provisioning by authorized systems
+# References:
+#   - https://attack.mitre.org/techniques/T1078/002/
+#   - https://docs.microsoft.com/en-us/windows/security/threat-protection/auditing/event-4732
+#
+# Usage: Copy this query into Splunk Search & Reporting
+# Required: Windows Security audit policy — Audit Security Group Management enabled
+#
+# ============================================================================
+# LEARNING NOTES — For SOC Analyst Study
+# ============================================================================
+#
+# LEARNING: WHAT THIS DETECTS AND WHY ATTACKERS DO IT
+#   This detects when users are added to privileged Active Directory groups like
+#   Domain Admins, Enterprise Admins, or local Administrators. Attackers do this
+#   to ESCALATE PRIVILEGES — once their compromised account is in Domain Admins,
+#   they have full control over the entire AD domain. This is one of the most
+#   impactful actions an attacker can take because it gives persistent god-mode
+#   access to every system in the domain.
+#
+# LEARNING: WHAT HAPPENS TECHNICALLY
+#   1. Attacker compromises an account with permission to modify AD group membership
+#      (e.g., Account Operators, or an account with delegated rights)
+#   2. They run: net group "Domain Admins" compromised_user /add /domain
+#   3. Active Directory processes the group change
+#   4. Windows logs Event 4728 (global group), 4732 (local group), or 4756 (universal group)
+#   5. The compromised account now has Domain Admin privileges
+#   In mature environments, admin group changes are RARE and should ALWAYS be investigated.
+#
+# LEARNING: WHY EVENTS 4728, 4732, 4756?
+#   Active Directory has three types of security groups:
+#   - Global groups (4728): Domain Admins, Domain Users — scope within one domain
+#   - Local groups (4732): Administrators, Backup Operators — scope on one machine
+#   - Universal groups (4756): Enterprise Admins, Schema Admins — scope across entire forest
+#   Each type generates a different Event ID when a member is added, so we monitor all three.
+#   These events include WHO made the change and WHO was added.
+# ============================================================================
+
+# LEARNING: Three Event IDs monitored — each covers a different AD group type
+index=wineventlog sourcetype="WinEventLog:Security"
+    (EventCode=4728 OR EventCode=4732 OR EventCode=4756)
+    ``` Focus on privileged/sensitive groups ```
+# LEARNING: "coalesce()" handles different field naming across Splunk TA versions
+| eval target_group=coalesce(TargetUserName, Group_Name)
+# LEARNING: "| where match(target_group, regex)" — Only alert on SENSITIVE groups
+#   Not all group modifications matter — we only care about privileged groups:
+#   - Domain Admins: Full control over the domain
+#   - Enterprise Admins: Full control over the entire AD forest
+#   - Schema Admins: Can modify AD schema (very dangerous)
+#   - DNSAdmins: Can escalate to Domain Admin via DLL injection into DNS service
+#   - Backup Operators: Can read any file on the domain (including NTDS.dit)
+| where match(target_group, "(?i)(domain admins|enterprise admins|schema admins|administrators|account operators|server operators|backup operators|print operators|dnsadmins|group policy creator owners|remote desktop users)")
+    ``` Parse member and actor details ```
+| eval event_time=strftime(_time, "%Y-%m-%d %H:%M:%S")
+# LEARNING: Two key actors in every group change event:
+#   added_member = WHO was added to the group (the account gaining privileges)
+#   performed_by = WHO made the change (the actor — could be attacker or admin)
+| eval added_member=coalesce(MemberName, Member_Name)
+| eval added_member_sid=coalesce(MemberSid, Member_ID)
+| eval performed_by=coalesce(SubjectUserName, Security_ID)
+| eval performer_domain=coalesce(SubjectDomainName, Account_Domain)
+# LEARNING: Labels each event with the group type and Event ID for context
+| eval group_change_type=case(
+    EventCode=4728, "Global Group (4728)",
+    EventCode=4732, "Local Group (4732)",
+    EventCode=4756, "Universal Group (4756)",
+    1=1, "Unknown"
+    )
+    ``` Risk classification based on target group sensitivity ```
+# LEARNING: "Tier 0" is the highest sensitivity tier in Active Directory security models
+#   Tier 0 = Domain Admins, Enterprise Admins, Schema Admins (keys to the kingdom)
+#   DNSAdmins is flagged as "privilege escalation path" because it can be abused
+#   to load a malicious DLL into the DNS service, which runs as SYSTEM on DCs
+| eval group_risk=case(
+    match(target_group, "(?i)(domain admins|enterprise admins|schema admins)"), "Critical - Tier 0 admin group",
+    match(target_group, "(?i)(administrators|account operators)"), "High - Elevated privilege group",
+    match(target_group, "(?i)(dnsadmins)"), "High - Potential privilege escalation path",
+    1=1, "Medium - Privileged group"
+    )
+    ``` Detect potential anomalies ```
+# LEARNING: Time-based anomaly detection — changes outside business hours or on weekends
+#   are more suspicious because legitimate admin changes usually happen during work hours
+#   with change management approval
+| eval hour_of_change=strftime(_time, "%H")
+| eval is_off_hours=if(hour_of_change < 7 OR hour_of_change > 19, "Yes", "No")
+# LEARNING: strftime "%u" returns day of week (1=Monday, 7=Sunday), >5 means Sat/Sun
+| eval is_weekend=if(strftime(_time, "%u") > 5, "Yes", "No")
+# LEARNING: "| stats ... by Computer, performed_by, performer_domain" — Groups changes per actor
+#   This answers: "What did this person do?" — showing all their group modifications together
+| stats count as change_count
+        values(added_member) as members_added
+        values(target_group) as target_groups
+        values(group_change_type) as change_types
+        values(group_risk) as risk_assessment
+        values(is_off_hours) as off_hours_change
+        values(is_weekend) as weekend_change
+        earliest(event_time) as first_change
+        latest(event_time) as last_change
+    by Computer, performed_by, performer_domain
+    ``` Escalate risk for multiple group additions by same actor ```
+# LEARNING: Behavioral escalation — if one person adds users to 4+ groups,
+#   that is highly unusual and suggests an attacker is rapidly escalating privileges
+| eval overall_risk=case(
+    change_count > 3, "Critical - Bulk admin group changes",
+    match(risk_assessment, "Critical"), "Critical",
+    match(off_hours_change, "Yes") OR match(weekend_change, "Yes"), "High - Off-hours change",
+    1=1, "High"
+    )
+| sort - overall_risk, - change_count
+# LEARNING: "| table" — Final output for SOC investigation
+#   Key fields: performed_by (who made the change), members_added (who gained access),
+#   target_groups (which privileged groups), off_hours_change/weekend_change (timing anomalies)
+| table Computer, performer_domain, performed_by, members_added, target_groups, change_types, risk_assessment, off_hours_change, weekend_change, change_count, first_change, last_change, overall_risk

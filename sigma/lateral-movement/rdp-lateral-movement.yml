@@ -1,0 +1,35 @@
+title: Suspicious RDP Lateral Movement to Multiple Hosts
+id: f6c8a3b7-4e9d-4f1a-a2b3-6d7c8e9f0a1b
+status: experimental
+level: high
+description: |
+    Detects Remote Desktop Protocol (RDP) lateral movement by identifying
+    Type 10 (RemoteInteractive) logon events from internal source IPs. While
+    individual RDP connections are normal, this rule helps identify patterns
+    where a single source connects to multiple targets, which is consistent
+    with an attacker pivoting through the network using compromised credentials.
+references:
+    - https://attack.mitre.org/techniques/T1021/001/
+    - https://jpcertcc.github.io/ToolAnalysisResultSheet/details/mstsc.htm
+author: Kud Lee
+date: 2026/03/19
+tags:
+    - attack.lateral_movement
+    - attack.t1021.001
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4624
+        LogonType: 10
+    filter_local:
+        IpAddress:
+            - '127.0.0.1'
+            - '::1'
+            - '-'
+    condition: selection and not filter_local
+falsepositives:
+    - IT administrators performing maintenance across multiple servers
+    - Jump server or bastion host legitimate connections
+    - Automated monitoring tools performing RDP health checks

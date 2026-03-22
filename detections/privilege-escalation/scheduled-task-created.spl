@@ -1,0 +1,139 @@
+# Detection: Scheduled Task Creation via schtasks.exe
+# ATT&CK: T1053.005 — Scheduled Task/Job: Scheduled Task
+# Tactic: Privilege Escalation / Persistence / Execution
+# Log Source: Sysmon Event ID 1 (Process Creation)
+# Severity: Medium
+# Description: Detects the creation of scheduled tasks via schtasks.exe command
+#   line. Attackers use scheduled tasks for persistence (tasks survive reboots),
+#   privilege escalation (tasks can run as SYSTEM), and execution (tasks can be
+#   triggered remotely). This detection focuses on schtasks.exe /create commands
+#   and flags suspicious patterns such as tasks running from temp directories,
+#   using encoded PowerShell, executing as SYSTEM, or targeting remote hosts.
+# False Positives:
+#   - Legitimate task scheduling by administrators
+#   - Software installations creating maintenance tasks
+#   - Group Policy deploying scheduled tasks
+#   - SCCM/Intune task deployments
+# References:
+#   - https://attack.mitre.org/techniques/T1053/005/
+#   - https://docs.microsoft.com/en-us/windows/win32/taskschd/schtasks
+#
+# Usage: Copy this query into Splunk Search & Reporting
+# Required: Sysmon installed with Process Creation logging (Event ID 1) enabled
+#
+# ============================================================================
+# LEARNING NOTES — For SOC Analyst Study
+# ============================================================================
+#
+# LEARNING: WHAT THIS DETECTS AND WHY ATTACKERS DO IT
+#   Scheduled Tasks allow commands to run automatically on a schedule or trigger.
+#   Attackers abuse them for three purposes:
+#   1. PERSISTENCE — Tasks survive reboots and run on a schedule (like Run keys but more flexible)
+#   2. PRIVILEGE ESCALATION — Tasks can be configured to run as SYSTEM (highest privilege)
+#   3. LATERAL MOVEMENT — schtasks.exe /s flag creates tasks on REMOTE machines
+#   This is a very versatile technique: an attacker can schedule a reverse shell
+#   to execute every hour, ensuring they always have access even if discovered.
+#
+# LEARNING: WHAT HAPPENS TECHNICALLY
+#   1. Attacker runs: schtasks /create /tn "WindowsUpdate" /tr "C:\Temp\payload.exe"
+#      /sc daily /ru SYSTEM
+#   2. Windows Task Scheduler registers the new task
+#   3. Sysmon logs the schtasks.exe process creation with full command line (Event ID 1)
+#   4. The command line reveals: task name (/tn), command to run (/tr),
+#      schedule (/sc), run-as account (/ru), and optionally remote host (/s)
+#   5. The task executes at the scheduled time with the specified privileges
+#
+# LEARNING: WHY SYSMON EVENT ID 1?
+#   We detect this via process creation (schtasks.exe being executed) rather than
+#   the task creation event (Event ID 4698 in Security log) because:
+#   1. Sysmon provides the full command line with all parameters
+#   2. We can see the parent process (what launched schtasks.exe)
+#   3. Sysmon is more reliably deployed than Security event 4698 auditing
+#   The command line parameters reveal the attacker's full intent.
+# ============================================================================
+
+# LEARNING: "Image="*\\schtasks.exe"" — Only match the schtasks.exe process being created
+#   Image is the Sysmon field for the executable path of the new process
+index=sysmon EventCode=1 Image="*\\schtasks.exe"
+    ``` Focus on task creation commands ```
+# LEARNING: "\/create" — schtasks.exe has subcommands: /create, /delete, /query, /run
+#   We only care about /create because that is when new persistence is established
+| where match(lower(CommandLine), "\/create")
+| eval event_time=strftime(_time, "%Y-%m-%d %H:%M:%S")
+# LEARNING: ParentImage tells us WHAT launched schtasks.exe
+#   If the parent is wmiprvse.exe or psexesvc.exe, the task was created REMOTELY
+| eval parent_process=mvindex(split(ParentImage, "\\"), -1)
+    ``` Extract task name if specified ```
+# LEARNING: "| rex" — Regex extraction to pull specific parameters from the command line
+#   /tn = Task Name (what the attacker named their task)
+#   Attackers often use innocent names like "WindowsUpdate" or "SystemCheck"
+| rex field=CommandLine "(?i)/tn\s+[\"']?(?<task_name>[^\"'/]+)"
+    ``` Extract the program/command the task will run ```
+# LEARNING: /tr = Task Run (the actual command/program the task will execute)
+#   This is the most important field — it shows WHAT will be executed
+| rex field=CommandLine "(?i)/tr\s+[\"']?(?<task_command>[^\"']+?)\s*(?=/|$)"
+    ``` Extract schedule frequency ```
+# LEARNING: /sc = Schedule type (once, daily, weekly, onstart, onlogon, etc.)
+#   "onstart" and "onlogon" are common persistence triggers
+| rex field=CommandLine "(?i)/sc\s+(?<schedule_type>\w+)"
+    ``` Extract run-as user if specified ```
+# LEARNING: /ru = Run as User — SYSTEM means highest privilege
+#   If an attacker specifies /ru SYSTEM, their task runs with kernel-level access
+| rex field=CommandLine "(?i)/ru\s+[\"']?(?<run_as_user>[^\"'\s]+)"
+    ``` Detect remote task creation ```
+# LEARNING: /s = remote Server — if present, the task is being created on ANOTHER machine
+#   This indicates lateral movement: attacker on Machine A creates a task on Machine B
+| rex field=CommandLine "(?i)/s\s+[\"']?(?<remote_host>[^\"'\s]+)"
+    ``` Risk classification ```
+# LEARNING: Building a list of risk indicators using mvappend() (multi-value append)
+#   Each suspicious characteristic adds a flag to the list.
+#   More flags = higher risk. This is a cumulative risk scoring approach.
+| eval risk_indicators=""
+# LEARNING: Each "if" checks for a specific red flag and appends to the indicator list:
+#   - Runs as SYSTEM = privilege escalation
+#   - Temp directory = likely malware (not installed software)
+#   - Encoded PowerShell = obfuscated command, almost always malicious
+#   - Remote creation (/s) = lateral movement
+#   - CMD wrapper = command execution, not a standalone program
+#   - Parent is wmiprvse/psexesvc = created via remote execution tool
+#   - Script files (.bat, .ps1) = unusual for legitimate scheduled tasks
+| eval risk_indicators=if(match(CommandLine, "(?i)/ru\s+[\"']?system"), mvappend(risk_indicators, "Runs as SYSTEM"), risk_indicators)
+| eval risk_indicators=if(match(CommandLine, "(?i)(\\\\temp\\\\|\\\\tmp\\\\|\\\\appdata\\\\)"), mvappend(risk_indicators, "Executes from temp directory"), risk_indicators)
+| eval risk_indicators=if(match(CommandLine, "(?i)(powershell.*-enc|powershell.*-e\s|powershell.*downloadstring|powershell.*iex)"), mvappend(risk_indicators, "Suspicious PowerShell in task"), risk_indicators)
+| eval risk_indicators=if(match(CommandLine, "(?i)/s\s+"), mvappend(risk_indicators, "Remote task creation"), risk_indicators)
+| eval risk_indicators=if(match(CommandLine, "(?i)(cmd\.exe\s*/c|cmd\.exe\s*/k)"), mvappend(risk_indicators, "CMD execution wrapper"), risk_indicators)
+| eval risk_indicators=if(match(ParentImage, "(?i)(wmiprvse|psexesvc|wsmprovhost)"), mvappend(risk_indicators, "Created via remote execution"), risk_indicators)
+| eval risk_indicators=if(match(CommandLine, "(?i)\.(bat|ps1|vbs|js|hta)"), mvappend(risk_indicators, "Script file scheduled"), risk_indicators)
+    ``` Determine overall risk ```
+# LEARNING: "mvcount()" counts how many risk flags were triggered
+#   3+ flags = Critical (e.g., remote + SYSTEM + encoded PowerShell = very bad)
+#   2 flags = High, 1 flag = Medium, 0 flags = Low (filtered out)
+| eval risk_count=mvcount(risk_indicators)
+| eval risk_level=case(
+    risk_count >= 3, "Critical",
+    risk_count >= 2, "High",
+    risk_count >= 1, "Medium",
+    1=1, "Low"
+    )
+# LEARNING: Filter out Low risk to reduce noise — only show tasks with at least one red flag
+| where risk_level != "Low"
+# LEARNING: "| stats ... by Computer, risk_level" — Groups task creations per host and risk
+#   values(task_name) = all task names created (multiple = mass persistence)
+#   values(remote_host) = what other machines were targeted (lateral movement map)
+| stats count as task_creation_count
+        values(task_name) as task_names
+        values(task_command) as task_commands
+        values(schedule_type) as schedules
+        values(run_as_user) as run_as_users
+        values(remote_host) as remote_hosts
+        values(parent_process) as parent_processes
+        values(User) as creating_users
+        values(risk_indicators) as risk_flags
+        earliest(event_time) as first_seen
+        latest(event_time) as last_seen
+    by Computer, risk_level
+| sort - risk_level, - task_creation_count
+# LEARNING: "| table" — Final output for SOC analyst review
+#   Key fields: task_names (persistence label), task_commands (what executes),
+#   run_as_users (privilege level), risk_flags (why this was flagged)
+| table Computer, creating_users, parent_processes, task_names, task_commands, schedules, run_as_users, remote_hosts, risk_flags, task_creation_count, first_seen, last_seen, risk_level

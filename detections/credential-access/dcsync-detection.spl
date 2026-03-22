@@ -1,0 +1,110 @@
+# Detection: DCSync Attack via Directory Replication
+# ATT&CK: T1003.006 — OS Credential Dumping: DCSync
+# Tactic: Credential Access
+# Log Source: Windows Security Event ID 4662 (Directory Service Access)
+# Severity: Critical
+# Description: Detects DCSync attacks by monitoring for directory replication
+#   service access rights on domain controller objects. DCSync abuses the
+#   MS-DRSR (Directory Replication Service Remote) protocol to request password
+#   data from the domain controller, effectively impersonating a DC. Attackers
+#   use tools like Mimikatz (lsadump::dcsync) to extract credentials without
+#   executing code on the DC itself. The key indicators are specific replication
+#   GUIDs requested via Event 4662.
+# False Positives:
+#   - Legitimate domain controller replication between DCs
+#   - Azure AD Connect synchronization service accounts
+#   - Authorized backup tools with replication permissions
+# References:
+#   - https://attack.mitre.org/techniques/T1003/006/
+#   - https://adsecurity.org/?p=1729
+#
+# Usage: Copy this query into Splunk Search & Reporting
+# Required: Windows Security audit policy — Audit Directory Service Access enabled
+#
+# ============================================================================
+# LEARNING NOTES — For SOC Analyst Study
+# ============================================================================
+#
+# LEARNING: WHAT THIS DETECTS AND WHY ATTACKERS DO IT
+#   DCSync is a credential theft technique where an attacker impersonates a
+#   Domain Controller and requests password replication data from a real DC.
+#   In Active Directory, DCs replicate data between each other using the
+#   MS-DRSR (Directory Replication Service Remote) protocol. Tools like
+#   Mimikatz (lsadump::dcsync) exploit this protocol to pull password hashes
+#   for ANY domain account — including krbtgt (Golden Ticket!) and Domain Admins.
+#   The attacker does NOT need to run code on the DC itself, making this very stealthy.
+#
+# LEARNING: WHAT HAPPENS TECHNICALLY
+#   1. Attacker compromises an account with "Replicating Directory Changes" rights
+#      (Domain Admins have this by default)
+#   2. Attacker runs: mimikatz "lsadump::dcsync /domain:corp.local /user:krbtgt"
+#   3. Mimikatz sends a DRSGetNCChanges request to the DC, pretending to be another DC
+#   4. The real DC responds with the requested user's password hash data
+#   5. Windows logs Event 4662 because a directory service object was accessed
+#      with specific replication GUIDs in the Properties field
+#
+# LEARNING: WHY EVENT ID 4662?
+#   Event 4662 fires when an Active Directory object is accessed. The Properties
+#   field contains GUIDs representing the specific access rights used. The three
+#   GUIDs we look for correspond to replication permissions:
+#   - DS-Replication-Get-Changes (read replicated data)
+#   - DS-Replication-Get-Changes-All (read secret/confidential replicated data — passwords!)
+#   - DS-Replication-Get-Changes-In-Filtered-Set (read filtered attributes)
+#   A legitimate DC replication uses machine accounts (ending in $), so we exclude those.
+# ============================================================================
+
+# LEARNING: "index=wineventlog sourcetype="WinEventLog:Security"" — Searches Windows Security logs
+#   These are the native Windows audit logs (not Sysmon)
+# LEARNING: "EventCode=4662" — Directory Service Access event
+index=wineventlog sourcetype="WinEventLog:Security" EventCode=4662
+    ``` DS-Replication-Get-Changes: 1131f6aa-9c07-11d1-f79f-00c04fc2dcd2 ```
+    ``` DS-Replication-Get-Changes-All: 1131f6ad-9c07-11d1-f79f-00c04fc2dcd2 ```
+    ``` DS-Replication-Get-Changes-In-Filtered-Set: 89e95b76-444d-4c62-991a-0facbeda640c ```
+# LEARNING: "| where match(Properties, regex)" — Checks if the Properties field contains any of
+#   these three GUIDs. These are the Active Directory replication permission GUIDs.
+#   If someone is requesting these permissions, they are trying to replicate AD data.
+| where match(Properties, "(?i)(1131f6aa-9c07-11d1-f79f-00c04fc2dcd2|1131f6ad-9c07-11d1-f79f-00c04fc2dcd2|89e95b76-444d-4c62-991a-0facbeda640c)")
+    ``` Exclude legitimate domain controller machine accounts ```
+# LEARNING: "\$$" — In AD, machine accounts end with "$" (e.g., "DC01$")
+#   Real DC-to-DC replication uses these machine accounts, so we exclude them
+#   If a HUMAN account requests replication, that is suspicious
+| where NOT match(SubjectUserName, "\$$")
+    ``` Exclude known replication service accounts ```
+# LEARNING: Excluding Azure AD Connect service accounts (MSOL_, AAD_) which legitimately replicate
+| where NOT match(SubjectUserName, "(?i)(MSOL_|AAD_|svc_azuread)")
+    ``` Correlate — true DCSync requires both Get-Changes and Get-Changes-All ```
+# LEARNING: "| eval ... = if(match(...), 1, 0)" — Creates boolean flags (1 or 0)
+#   A true DCSync attack needs BOTH Get-Changes AND Get-Changes-All permissions.
+#   Just one alone could be normal activity; both together is the strong signal.
+| eval has_get_changes=if(match(Properties, "1131f6aa-9c07-11d1-f79f-00c04fc2dcd2"), 1, 0)
+| eval has_get_changes_all=if(match(Properties, "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2"), 1, 0)
+| eval event_time=strftime(_time, "%Y-%m-%d %H:%M:%S")
+# LEARNING: "| stats" — Groups by Computer, user, domain, and source IP to build a picture
+#   sum(has_get_changes) — Total times Get-Changes was requested
+#   sum(has_get_changes_all) — Total times Get-Changes-All was requested
+#   dc(ObjectName) — "dc" = distinct count; how many different AD objects were targeted
+#   by ... ClientAddress — The IP address making the request (attacker's workstation)
+| stats count as replication_requests
+        sum(has_get_changes) as get_changes_count
+        sum(has_get_changes_all) as get_changes_all_count
+        earliest(event_time) as first_seen
+        latest(event_time) as last_seen
+        values(SubjectLogonId) as logon_ids
+        dc(ObjectName) as unique_objects_accessed
+    by Computer, SubjectUserName, SubjectDomainName, ClientAddress
+    ``` Flag only when both required rights are observed (strong indicator) ```
+# LEARNING: This is the key correlation — BOTH rights must be present for a true DCSync
+#   This reduces false positives significantly
+| where get_changes_count > 0 AND get_changes_all_count > 0
+# LEARNING: Risk scoring context:
+#   If the Computer name does NOT contain "DC" or "domain," a non-DC is requesting replication → Critical
+#   High volume (>50 requests) suggests dumping many accounts → Critical
+| eval severity=case(
+    NOT match(Computer, "(?i)(DC|domain)"), "Critical - Non-DC initiated replication",
+    replication_requests > 50, "Critical - High volume replication",
+    1=1, "High - Suspicious replication access"
+    )
+| sort - replication_requests
+# LEARNING: "| table" — Final analyst view showing WHO (SubjectUserName) requested
+#   replication from WHERE (ClientAddress) on which DC (Computer)
+| table Computer, SubjectDomainName, SubjectUserName, ClientAddress, replication_requests, get_changes_count, get_changes_all_count, unique_objects_accessed, first_seen, last_seen, severity

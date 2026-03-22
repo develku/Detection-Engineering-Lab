@@ -1,0 +1,55 @@
+title: NTDS.dit Extraction via Shadow Copy Creation
+id: d4a6e1f5-2c7b-4d9e-e0f1-4b5a6c7d8e9f
+status: experimental
+level: critical
+description: |
+    Detects attempts to create Volume Shadow Copies or use ntdsutil for the
+    purpose of extracting the NTDS.dit Active Directory database. NTDS.dit
+    contains password hashes and Kerberos keys for all domain accounts.
+    Attackers create shadow copies via vssadmin, wmic, or ntdsutil to access
+    the locked database file and extract it for offline credential dumping.
+references:
+    - https://attack.mitre.org/techniques/T1003/003/
+    - https://www.ired.team/offensive-security/credential-access-and-credential-dumping/ntds.dit-enumeration
+author: Kud Lee
+date: 2026/03/19
+tags:
+    - attack.credential_access
+    - attack.t1003.003
+logsource:
+    category: process_creation
+    product: windows
+detection:
+    selection_vssadmin:
+        EventID: 1
+        Image|endswith: '\vssadmin.exe'
+        CommandLine|contains|all:
+            - 'create'
+            - 'shadow'
+    selection_wmic:
+        EventID: 1
+        Image|endswith: '\wmic.exe'
+        CommandLine|contains|all:
+            - 'shadowcopy'
+            - 'create'
+    selection_ntdsutil:
+        EventID: 1
+        Image|endswith: '\ntdsutil.exe'
+        CommandLine|contains:
+            - 'ifm'
+            - 'snapshot'
+            - 'activate instance ntds'
+    selection_copy_ntds:
+        EventID: 1
+        CommandLine|contains|all:
+            - 'copy'
+            - 'ntds.dit'
+    selection_esentutl:
+        EventID: 1
+        Image|endswith: '\esentutl.exe'
+        CommandLine|contains: 'ntds'
+    condition: selection_vssadmin or selection_wmic or selection_ntdsutil or selection_copy_ntds or selection_esentutl
+falsepositives:
+    - Legitimate backup operations using Volume Shadow Copy on domain controllers
+    - Windows Server Backup scheduled tasks
+    - Authorized system state backups by domain administrators

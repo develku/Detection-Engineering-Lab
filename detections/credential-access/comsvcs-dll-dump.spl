@@ -1,0 +1,101 @@
+# Detection: LSASS Dump via comsvcs.dll MiniDump
+# ATT&CK: T1003.001 — OS Credential Dumping: LSASS Memory
+# Tactic: Credential Access
+# Log Source: Sysmon Event ID 1 (Process Creation)
+# Severity: Critical
+# Description: Detects the use of comsvcs.dll with the MiniDump export to dump
+#   LSASS process memory. This is a living-off-the-land (LOLBin) technique that
+#   abuses the legitimate Windows DLL comsvcs.dll via rundll32.exe. Attackers
+#   use this method because it avoids dropping known malicious binaries to disk.
+#   Common command: rundll32.exe C:\Windows\System32\comsvcs.dll MiniDump <PID> out.dmp full
+# False Positives:
+#   - Very rare in legitimate usage — comsvcs.dll MiniDump is almost exclusively
+#     used for malicious credential dumping
+# References:
+#   - https://attack.mitre.org/techniques/T1003/001/
+#   - https://lolbas-project.github.io/lolbas/Libraries/Comsvcs/
+#
+# Usage: Copy this query into Splunk Search & Reporting
+# Required: Sysmon installed with Process Creation logging (Event ID 1) enabled
+#
+# ============================================================================
+# LEARNING NOTES — For SOC Analyst Study
+# ============================================================================
+#
+# LEARNING: WHAT THIS DETECTS AND WHY ATTACKERS DO IT
+#   This detects a "Living off the Land" (LOLBin) technique where attackers use
+#   the legitimate Windows DLL comsvcs.dll to dump LSASS memory. Instead of
+#   dropping Mimikatz (which AV would flag), they use a DLL that already exists
+#   on every Windows system. The comsvcs.dll has an exported function called
+#   "MiniDump" that can create a memory dump of any process.
+#   Attackers run: rundll32.exe C:\Windows\System32\comsvcs.dll MiniDump <LSASS_PID> out.dmp full
+#   This gives them LSASS credentials without using any malicious binary.
+#
+# LEARNING: WHAT HAPPENS TECHNICALLY
+#   1. Attacker finds the LSASS process ID (e.g., via "tasklist | findstr lsass")
+#   2. Attacker calls rundll32.exe to load comsvcs.dll and invoke its MiniDump function
+#   3. MiniDump calls MiniDumpWriteDump() API to write LSASS memory to a .dmp file
+#   4. Attacker exfiltrates the .dmp file and extracts credentials offline
+#   The "#24" variant uses the ordinal number of the MiniDump export instead of
+#   its name, as an evasion technique against simple string matching.
+#
+# LEARNING: WHY SYSMON EVENT ID 1?
+#   Sysmon Event ID 1 (Process Creation) logs every new process, including its
+#   full command line. This is critical because the command line reveals the intent:
+#   we can see "comsvcs.dll MiniDump" in the arguments passed to rundll32.exe.
+#   Windows native logging (Event 4688) can also capture command lines, but Sysmon
+#   provides richer context like parent process details and process GUIDs.
+# ============================================================================
+
+# LEARNING: "index=sysmon EventCode=1" — Search Sysmon process creation events
+#   Every time a new process starts on Windows, Sysmon logs it here with full command line
+index=sysmon EventCode=1
+    ``` Look for rundll32 executing comsvcs.dll with MiniDump ```
+# LEARNING: "| where ... like(...)" — Filters rows using pattern matching (% = wildcard, like SQL LIKE)
+#   Three OR conditions catch different evasion variants:
+#   1. "comsvcs" + "minidump" — Standard invocation
+#   2. "comsvcs.dll" + "#24" — Using ordinal number instead of function name to evade detection
+#   3. "comsvcs" + "full" — The "full" parameter for a complete memory dump
+#   lower() ensures case-insensitive matching
+| where (like(lower(CommandLine), "%comsvcs%") AND like(lower(CommandLine), "%minidump%"))
+    OR (like(lower(CommandLine), "%comsvcs.dll%") AND like(lower(CommandLine), "%#24%"))
+    OR (like(lower(CommandLine), "%comsvcs%") AND like(lower(CommandLine), "%full%"))
+    ``` Extract key process details ```
+# LEARNING: Extracting just the filename from the full path for readability
+#   ParentImage shows WHAT launched rundll32 (e.g., cmd.exe or powershell.exe)
+#   Image shows the process itself (usually rundll32.exe)
+| eval parent_process=mvindex(split(ParentImage, "\\"), -1)
+| eval process_name=mvindex(split(Image, "\\"), -1)
+    ``` Attempt to identify target PID from command line ```
+# LEARNING: "| rex" — Extracts data from a field using regex and creates a new field
+#   This regex captures the numeric PID after "minidump" in the command line
+#   (?i) = case insensitive, \s+ = one or more spaces, (?<target_pid>\d+) = named capture group
+#   Example: "MiniDump 672 out.dmp" → target_pid = "672" (which is likely LSASS's PID)
+| rex field=CommandLine "(?i)minidump\s+(?<target_pid>\d+)"
+    ``` Enrich with timing and context ```
+| eval event_time=strftime(_time, "%Y-%m-%d %H:%M:%S")
+# LEARNING: Risk classification based on context clues in the command
+#   If "lsass" appears in the command line, the attacker explicitly targeted LSASS → Critical
+#   If parent is cmd/powershell, this was manually run from a shell → High (interactive attacker)
+| eval risk_indicator=case(
+    match(CommandLine, "(?i)lsass"), "Critical - LSASS explicitly targeted",
+    match(ParentImage, "(?i)(cmd|powershell|pwsh)"), "High - Launched from shell",
+    1=1, "High - comsvcs.dll MiniDump invocation"
+    )
+# LEARNING: "| stats ... by Computer, process_name" — Aggregates all matching events per host
+#   count = how many times this happened
+#   earliest/latest = time range of activity
+#   values() = collects all unique values (shows all different commands used)
+| stats count as execution_count
+        earliest(event_time) as first_execution
+        latest(event_time) as last_execution
+        values(CommandLine) as commands
+        values(parent_process) as parent_processes
+        values(User) as users
+        values(risk_indicator) as risk_level
+    by Computer, process_name
+# LEARNING: "| sort - execution_count" — Most frequently executed appear first (- = descending)
+| sort - execution_count
+# LEARNING: "| table" — Final output columns for the analyst to review
+#   Key fields: Computer (where), users (who), commands (exactly what was run), risk_level (priority)
+| table Computer, process_name, parent_processes, users, commands, target_pid, execution_count, first_execution, last_execution, risk_level

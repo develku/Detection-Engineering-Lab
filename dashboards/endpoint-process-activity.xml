@@ -1,0 +1,216 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<dashboard version="1.1" theme="dark">
+  <label>Endpoint Process Activity</label>
+  <description>Monitor suspicious process execution, LOLBin usage, encoded commands, and LSASS access across endpoints. | ATT&amp;CK: T1059, T1218, T1003, T1543</description>
+
+  <!-- ============================================================
+       Dashboard: Endpoint Process Activity
+       Author: Kud Lee
+       Created: 2026-03-19
+       Log Sources: Sysmon (Event IDs 1, 7, 10, 13)
+       Index: sysmon
+       Purpose: Surface suspicious process behavior including Living Off
+                the Land Binaries, encoded PowerShell, LSASS access, and
+                abnormal parent-child process relationships.
+       ============================================================ -->
+
+  <fieldset submitButton="true" autoRun="true">
+    <input type="time" token="time_range" searchWhenChanged="true">
+      <label>Time Range</label>
+      <default>
+        <earliest>-24h@h</earliest>
+        <latest>now</latest>
+      </default>
+    </input>
+    <input type="dropdown" token="host_filter" searchWhenChanged="true">
+      <label>Host</label>
+      <choice value="*">All Hosts</choice>
+      <default>*</default>
+      <search>
+        <query>index=sysmon EventCode=1 earliest=-24h | stats count by Computer | sort - count</query>
+      </search>
+      <fieldForLabel>Computer</fieldForLabel>
+      <fieldForValue>Computer</fieldForValue>
+    </input>
+  </fieldset>
+
+  <!-- ===================== ROW 1: Suspicious Process Creations (LOLBins) ===================== -->
+  <row>
+    <panel>
+      <title>Suspicious Process Creations - LOLBins (Sysmon Event 1)</title>
+      <table>
+        <search>
+          <query>index=sysmon EventCode=1 Computer=$host_filter$
+| eval process_name=lower(mvindex(split(Image, "\\"), -1))
+| where process_name IN (
+    "certutil.exe", "mshta.exe", "regsvr32.exe", "rundll32.exe",
+    "wscript.exe", "cscript.exe", "msbuild.exe", "installutil.exe",
+    "regasm.exe", "regsvcs.exe", "cmstp.exe", "bitsadmin.exe",
+    "esentutl.exe", "expand.exe", "extrac32.exe", "findstr.exe",
+    "forfiles.exe", "hh.exe", "ieexec.exe", "infdefaultinstall.exe",
+    "makecab.exe", "mavinject.exe", "microsoft.workflow.compiler.exe",
+    "mmc.exe", "msconfig.exe", "msdt.exe", "msiexec.exe",
+    "odbcconf.exe", "pcalua.exe", "pcwrun.exe", "presentationhost.exe",
+    "replace.exe", "rpcping.exe", "schtasks.exe", "scriptrunner.exe",
+    "syncappvpublishingserver.exe", "verclsid.exe", "wmic.exe",
+    "xwizard.exe", "cmd.exe", "powershell.exe", "pwsh.exe"
+    )
+| eval creation_time=strftime(_time, "%Y-%m-%d %H:%M:%S")
+| eval parent_name=mvindex(split(ParentImage, "\\"), -1)
+| eval cmd_snippet=substr(CommandLine, 1, 200)
+| table creation_time, Computer, User, parent_name, process_name, cmd_snippet, IntegrityLevel
+| rename creation_time as "Time", Computer as "Host", User as "User", parent_name as "Parent Process", process_name as "Process", cmd_snippet as "Command Line (truncated)", IntegrityLevel as "Integrity"
+| sort - Time
+| head 100</query>
+          <earliest>$time_range.earliest$</earliest>
+          <latest>$time_range.latest$</latest>
+        </search>
+        <option name="count">20</option>
+        <option name="drilldown">row</option>
+        <option name="refresh.display">progressbar</option>
+        <option name="wrap">true</option>
+      </table>
+    </panel>
+  </row>
+
+  <!-- ===================== ROW 2: Encoded PowerShell Commands ===================== -->
+  <row>
+    <panel>
+      <title>Encoded PowerShell Commands (Sysmon Event 1)</title>
+      <table>
+        <search>
+          <query>index=sysmon EventCode=1 Computer=$host_filter$
+    (Image="*\\powershell.exe" OR Image="*\\pwsh.exe")
+    (CommandLine="*-enc*" OR CommandLine="*-EncodedCommand*"
+     OR CommandLine="*-e *" OR CommandLine="*[Convert]::FromBase64*"
+     OR CommandLine="*bypass*" OR CommandLine="*-nop*"
+     OR CommandLine="*hidden*" OR CommandLine="*downloadstring*"
+     OR CommandLine="*iex*" OR CommandLine="*invoke-expression*"
+     OR CommandLine="*downloadfile*" OR CommandLine="*webclient*"
+     OR CommandLine="*bitstransfer*" OR CommandLine="*Net.Sockets*")
+| eval detection_time=strftime(_time, "%Y-%m-%d %H:%M:%S")
+| eval parent_name=mvindex(split(ParentImage, "\\"), -1)
+| eval flags=mvappend(
+    if(match(CommandLine, "(?i)-enc"), "ENCODED", null()),
+    if(match(CommandLine, "(?i)(downloadstring|downloadfile|webclient|bitstransfer)"), "DOWNLOAD", null()),
+    if(match(CommandLine, "(?i)(iex|invoke-expression)"), "EXEC", null()),
+    if(match(CommandLine, "(?i)bypass"), "BYPASS", null()),
+    if(match(CommandLine, "(?i)hidden"), "HIDDEN", null())
+    )
+| eval flags=mvjoin(flags, ", ")
+| eval cmd_preview=substr(CommandLine, 1, 300)
+| table detection_time, Computer, User, parent_name, flags, cmd_preview, ProcessId
+| rename detection_time as "Time", Computer as "Host", User as "User", parent_name as "Parent", flags as "Suspicious Flags", cmd_preview as "Command Line", ProcessId as "PID"
+| sort - Time</query>
+          <earliest>$time_range.earliest$</earliest>
+          <latest>$time_range.latest$</latest>
+        </search>
+        <option name="count">20</option>
+        <option name="drilldown">row</option>
+        <option name="wrap">true</option>
+        <format type="color" field="Suspicious Flags">
+          <colorPalette type="map">{"ENCODED":#DC4E41,"DOWNLOAD":#F1813F,"EXEC":#DC4E41}</colorPalette>
+        </format>
+      </table>
+    </panel>
+  </row>
+
+  <!-- ===================== ROW 3: LSASS Access Attempts ===================== -->
+  <row>
+    <panel>
+      <title>LSASS Access Attempts (Sysmon Event 10)</title>
+      <table>
+        <search>
+          <query>index=sysmon EventCode=10 TargetImage="*\\lsass.exe" Computer=$host_filter$
+| eval granted_hex=lower(GrantedAccess)
+| where granted_hex IN ("0x1010", "0x1038", "0x1fffff", "0x1f0fff", "0x1f1fff", "0x143a", "0x1410", "0x40")
+| where NOT match(SourceImage, "(?i)(csrss\.exe|wininit\.exe|wmiprvse\.exe|svchost\.exe|MsMpEng\.exe|SecurityHealthService\.exe|WerFault\.exe)")
+| eval access_time=strftime(_time, "%Y-%m-%d %H:%M:%S")
+| eval source_proc=mvindex(split(SourceImage, "\\"), -1)
+| eval risk=case(
+    match(SourceImage, "(?i)(temp|appdata|public|downloads)"), "CRITICAL",
+    granted_hex IN ("0x1fffff", "0x1f0fff"), "CRITICAL",
+    granted_hex IN ("0x1010", "0x1038"), "HIGH",
+    1=1, "MEDIUM"
+    )
+| table access_time, Computer, source_proc, SourceImage, GrantedAccess, SourceProcessId, risk
+| rename access_time as "Time", Computer as "Host", source_proc as "Source Process", SourceImage as "Full Path", GrantedAccess as "Access Rights", SourceProcessId as "Source PID", risk as "Risk"
+| sort - Time</query>
+          <earliest>$time_range.earliest$</earliest>
+          <latest>$time_range.latest$</latest>
+        </search>
+        <option name="count">20</option>
+        <option name="drilldown">row</option>
+        <format type="color" field="Risk">
+          <colorPalette type="map">{"CRITICAL":#DC4E41,"HIGH":#F1813F,"MEDIUM":#F8BE34}</colorPalette>
+        </format>
+      </table>
+    </panel>
+  </row>
+
+  <!-- ===================== ROW 4: New Services Installed ===================== -->
+  <row>
+    <panel>
+      <title>New Services Installed - Timeline (Sysmon Event 1 + WinEventLog 7045)</title>
+      <chart>
+        <search>
+          <query>(index=wineventlog EventCode=7045) OR (index=sysmon EventCode=1 Image="*\\sc.exe" CommandLine="*create*")
+| eval service_detail=coalesce(ServiceName, CommandLine)
+| eval source=case(
+    EventCode=7045, "System Event 7045",
+    EventCode=1, "Sysmon Process Create"
+    )
+| timechart span=1h count by source</query>
+          <earliest>$time_range.earliest$</earliest>
+          <latest>$time_range.latest$</latest>
+        </search>
+        <option name="charting.chart">column</option>
+        <option name="charting.chart.stackMode">stacked</option>
+        <option name="charting.axisTitleX.text">Time</option>
+        <option name="charting.axisTitleY.text">Service Installations</option>
+        <option name="charting.legend.placement">bottom</option>
+      </chart>
+    </panel>
+  </row>
+
+  <!-- ===================== ROW 5: Process Creation by Unusual Parents ===================== -->
+  <row>
+    <panel>
+      <title>Process Creation by Unusual Parent Processes (Sysmon Event 1)</title>
+      <table>
+        <search>
+          <query>index=sysmon EventCode=1 Computer=$host_filter$
+| eval parent_name=lower(mvindex(split(ParentImage, "\\"), -1))
+| eval child_name=lower(mvindex(split(Image, "\\"), -1))
+| eval suspicious_combo=case(
+    parent_name="winword.exe" AND child_name IN ("cmd.exe","powershell.exe","pwsh.exe","wscript.exe","cscript.exe","mshta.exe"), "Office spawning shell",
+    parent_name="excel.exe" AND child_name IN ("cmd.exe","powershell.exe","pwsh.exe","wscript.exe","cscript.exe","mshta.exe"), "Office spawning shell",
+    parent_name="outlook.exe" AND child_name IN ("cmd.exe","powershell.exe","pwsh.exe","wscript.exe","cscript.exe"), "Outlook spawning shell",
+    parent_name="wmiprvse.exe" AND child_name IN ("cmd.exe","powershell.exe","pwsh.exe"), "WMI lateral movement",
+    parent_name="services.exe" AND NOT match(Image, "(?i)\\\\(svchost|lsass|wininit|taskhost)\.exe$"), "Unusual service child",
+    parent_name="svchost.exe" AND child_name IN ("cmd.exe","powershell.exe","pwsh.exe","whoami.exe","net.exe","net1.exe"), "Svchost spawning recon",
+    parent_name="w3wp.exe" AND child_name IN ("cmd.exe","powershell.exe","pwsh.exe"), "IIS web shell",
+    parent_name="sqlservr.exe" AND child_name IN ("cmd.exe","powershell.exe","pwsh.exe"), "SQL Server shell",
+    parent_name="explorer.exe" AND child_name IN ("mshta.exe","regsvr32.exe","rundll32.exe") AND match(CommandLine, "(?i)(http|\\\\\\\\|javascript)"), "Explorer suspicious child",
+    1=1, null()
+    )
+| where isnotnull(suspicious_combo)
+| eval creation_time=strftime(_time, "%Y-%m-%d %H:%M:%S")
+| eval cmd_snippet=substr(CommandLine, 1, 250)
+| table creation_time, Computer, User, parent_name, child_name, suspicious_combo, cmd_snippet
+| rename creation_time as "Time", Computer as "Host", User as "User", parent_name as "Parent", child_name as "Child", suspicious_combo as "Detection Reason", cmd_snippet as "Command Line"
+| sort - Time
+| head 50</query>
+          <earliest>$time_range.earliest$</earliest>
+          <latest>$time_range.latest$</latest>
+        </search>
+        <option name="count">20</option>
+        <option name="drilldown">row</option>
+        <option name="wrap">true</option>
+        <format type="color" field="Detection Reason">
+          <colorPalette type="map">{"Office spawning shell":#DC4E41,"WMI lateral movement":#DC4E41,"IIS web shell":#DC4E41,"SQL Server shell":#DC4E41,"Outlook spawning shell":#F1813F,"Unusual service child":#F1813F,"Svchost spawning recon":#F8BE34,"Explorer suspicious child":#F8BE34}</colorPalette>
+        </format>
+      </table>
+    </panel>
+  </row>
+</dashboard>

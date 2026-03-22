@@ -1,0 +1,115 @@
+# Detection: PsExec Remote Execution
+# ATT&CK: T1570 — Lateral Tool Transfer
+# Tactic: Lateral Movement
+# Log Source: Sysmon Event ID 1 (Process Creation), Windows Security Event 4624 (Logon)
+# Severity: High
+# Description: Detects PsExec usage by identifying the PSEXESVC.exe service
+#   binary combined with Type 3 (Network) logon events. PsExec is a legitimate
+#   Sysinternals tool frequently abused by attackers and ransomware operators
+#   for lateral movement. It works by copying PSEXESVC.exe to the target's
+#   ADMIN$ share, creating a service, and executing commands remotely. Detection
+#   focuses on the service creation, named pipe usage, and process execution
+#   patterns characteristic of PsExec.
+# False Positives:
+#   - Legitimate system administration using PsExec
+#   - Software deployment tools that use PsExec
+#   - IT helpdesk remote support activities
+# References:
+#   - https://attack.mitre.org/techniques/T1570/
+#   - https://docs.microsoft.com/en-us/sysinternals/downloads/psexec
+#
+# Usage: Copy this query into Splunk Search & Reporting
+# Required: Sysmon installed, Windows Security audit policy for logon events
+#
+# ============================================================================
+# LEARNING NOTES — For SOC Analyst Study
+# ============================================================================
+#
+# LEARNING: WHAT THIS DETECTS AND WHY ATTACKERS DO IT
+#   PsExec is a legitimate Sysinternals tool used by admins to run commands on
+#   remote systems. Attackers and ransomware operators abuse it heavily for
+#   lateral movement — moving from one compromised machine to others across the
+#   network. It is one of the most common lateral movement tools because it is
+#   a signed Microsoft binary (trusted by most security tools) and comes
+#   pre-installed in many admin toolkits.
+#
+# LEARNING: WHAT HAPPENS TECHNICALLY
+#   1. Attacker runs: psexec.exe \\TARGET -u admin -p pass cmd.exe
+#   2. PsExec connects to TARGET's ADMIN$ share (\\TARGET\ADMIN$ = C:\Windows)
+#   3. PsExec copies PSEXESVC.exe to TARGET's C:\Windows directory
+#   4. PsExec uses the Service Control Manager (SCM) to create and start a service
+#   5. PSEXESVC.exe runs on TARGET and creates a named pipe for communication
+#   6. The attacker's commands execute on TARGET through PSEXESVC.exe
+#   This creates TWO types of artifacts: process creation (Sysmon) and network logon (Security log)
+#
+# LEARNING: WHY THESE LOG SOURCES?
+#   Sysmon Event ID 1 captures PSEXESVC.exe being created on the target system
+#   and any child processes it spawns (the attacker's actual commands).
+#   Windows Security Event 4624 with Logon_Type=3 (Network) captures the
+#   authentication from the source machine, revealing the attacker's source IP.
+#   Combining both gives us the full picture: WHO connected, FROM WHERE, and WHAT they ran.
+# ============================================================================
+
+# LEARNING: Splunk backtick comments (``` ```) are Splunk's native comment syntax
+#   They work inside SPL queries, unlike # which only works at line beginnings
+``` Search 1: Detect PSEXESVC.exe process creation on target systems ```
+# LEARNING: This initial search looks for four PsExec indicators in process creation events:
+#   1. PSEXESVC.exe running (service deployed to target)
+#   2. psexec.exe running (tool running on source machine)
+#   3. psexec64.exe (64-bit variant)
+#   4. Any process whose PARENT is PSEXESVC.exe (commands the attacker executed via PsExec)
+index=sysmon EventCode=1
+    (Image="*\\PSEXESVC.exe"
+    OR Image="*\\psexec.exe"
+    OR Image="*\\psexec64.exe"
+    OR ParentImage="*\\PSEXESVC.exe")
+| eval process_name=mvindex(split(Image, "\\"), -1)
+| eval parent_process=mvindex(split(ParentImage, "\\"), -1)
+# LEARNING: "role" classifies whether this machine is the SOURCE (running PsExec)
+#   or the TARGET (where PSEXESVC.exe landed). This is critical for understanding
+#   the direction of lateral movement in your network.
+| eval role=case(
+    match(Image, "(?i)psexesvc\.exe"), "Target - PsExec Service",
+    match(Image, "(?i)psexec"), "Source - PsExec Initiator",
+    match(ParentImage, "(?i)psexesvc\.exe"), "Target - Child Process of PsExec",
+    1=1, "Related"
+    )
+| eval event_time=strftime(_time, "%Y-%m-%d %H:%M:%S")
+    ``` Correlate with network logon events for stronger signal ```
+# LEARNING: "| join type=left Computer [subsearch]" — Enriches Sysmon data with Windows Security data
+#   This is like a SQL LEFT JOIN: for each Computer in our results, look up its recent
+#   network logon (Type 3) to find the SOURCE IP address of the connection.
+#   The subsearch runs independently and returns source_ip and logon_user per Computer.
+#   "type=left" means keep Sysmon results even if no matching logon event is found.
+| join type=left Computer
+    [search index=wineventlog sourcetype="WinEventLog:Security" EventCode=4624 Logon_Type=3
+    | rename src_ip as source_ip
+    | stats latest(source_ip) as network_logon_source, latest(TargetUserName) as logon_user by Computer]
+# LEARNING: "| stats" — Aggregates all PsExec activity per machine and process
+#   values(CommandLine) — Shows exactly what commands the attacker ran via PsExec
+#   values(role) — Shows if this was source, target, or child process
+#   values(network_logon_source) — The IP address the attacker came from
+| stats count as execution_count
+        values(CommandLine) as commands_executed
+        values(parent_process) as parent_processes
+        values(User) as users
+        values(role) as execution_role
+        values(network_logon_source) as source_ips
+        values(logon_user) as logon_users
+        earliest(event_time) as first_seen
+        latest(event_time) as last_seen
+    by Computer, process_name
+    ``` Risk scoring ```
+# LEARNING: Risk scoring context:
+#   >10 executions = attacker is hitting many machines (ransomware deployment pattern)
+#   Commands like whoami/net = attacker is doing reconnaissance on target systems
+| eval risk_level=case(
+    execution_count > 10, "Critical - Mass lateral movement",
+    match(commands_executed, "(?i)(cmd|powershell|whoami|net\s)"), "High - Suspicious commands",
+    1=1, "Medium - PsExec execution detected"
+    )
+| sort - execution_count
+# LEARNING: "| table" — Final output for SOC analyst triage
+#   Key columns: source_ips (where attacker came from), commands_executed (what they did),
+#   execution_role (source vs target machine), risk_level (triage priority)
+| table Computer, process_name, execution_role, parent_processes, users, logon_users, source_ips, commands_executed, execution_count, first_seen, last_seen, risk_level

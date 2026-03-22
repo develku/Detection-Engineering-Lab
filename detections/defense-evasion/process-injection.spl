@@ -1,0 +1,150 @@
+# Detection: Process Injection via CreateRemoteThread
+# ATT&CK: T1055 — Process Injection
+# Tactic: Defense Evasion / Privilege Escalation
+# Log Source: Sysmon Event ID 8 (CreateRemoteThread)
+# Severity: High
+# Description: Detects process injection via the CreateRemoteThread API call,
+#   logged by Sysmon Event ID 8. Process injection allows attackers to execute
+#   code in the address space of another process, enabling defense evasion
+#   (hiding in legitimate processes), privilege escalation (injecting into
+#   higher-privilege processes), and credential access (injecting into LSASS).
+#   Common injection targets include explorer.exe, svchost.exe, and lsass.exe.
+#   Legitimate use of CreateRemoteThread is limited and well-defined.
+# False Positives:
+#   - Antivirus/EDR products injecting monitoring DLLs
+#   - Application compatibility shims
+#   - Some debugging tools and profilers
+#   - Visual Studio JIT debugger
+# References:
+#   - https://attack.mitre.org/techniques/T1055/
+#   - https://www.elastic.co/blog/ten-process-injection-techniques
+#
+# Usage: Copy this query into Splunk Search & Reporting
+# Required: Sysmon installed with CreateRemoteThread logging (Event ID 8) enabled
+#
+# ============================================================================
+# LEARNING NOTES — For SOC Analyst Study
+# ============================================================================
+#
+# LEARNING: WHAT THIS DETECTS AND WHY ATTACKERS DO IT
+#   Process Injection is when an attacker inserts malicious code into the memory
+#   space of another running process. This achieves THREE objectives simultaneously:
+#   1. DEFENSE EVASION — Malicious code runs inside a trusted process (like explorer.exe
+#      or svchost.exe), making it invisible to process-level monitoring
+#   2. PRIVILEGE ESCALATION — Injecting into a higher-privilege process gains those privileges
+#   3. CREDENTIAL ACCESS — Injecting into lsass.exe can read credentials from memory
+#   Tools like Cobalt Strike, Metasploit, and most advanced malware use process injection.
+#
+# LEARNING: WHAT HAPPENS TECHNICALLY
+#   The CreateRemoteThread injection technique works in three steps:
+#   1. Attacker's process calls OpenProcess() to get a handle to the target process
+#   2. It calls VirtualAllocEx() to allocate memory in the target process
+#   3. It calls WriteProcessMemory() to write shellcode into that memory
+#   4. It calls CreateRemoteThread() to start a new thread in the target that runs the shellcode
+#   Now the malicious code is running INSIDE the trusted process — it inherits the
+#   target's trust level, network connections, and security context.
+#
+# LEARNING: WHY SYSMON EVENT ID 8?
+#   Event ID 8 fires specifically when CreateRemoteThread() is called — the moment
+#   one process creates a thread in another process's address space. This is unusual:
+#   normal programs do not create threads in OTHER processes. The few legitimate cases
+#   (AV/EDR, debuggers, certain Windows system processes) are well-known and can be excluded.
+#   Sysmon captures: who injected (SourceImage), who was injected into (TargetImage),
+#   and the start address/module of the injected thread.
+# ============================================================================
+
+# LEARNING: "EventCode=8" — Sysmon CreateRemoteThread events
+#   This is a relatively low-volume event type, making it efficient to monitor
+index=sysmon EventCode=8
+    ``` Sysmon Event 8 = CreateRemoteThread detected ```
+| eval event_time=strftime(_time, "%Y-%m-%d %H:%M:%S")
+# LEARNING: Extract just filenames from full paths for readability
+#   SourceImage = the process PERFORMING the injection (attacker's code)
+#   TargetImage = the process BEING INJECTED INTO (the victim process)
+| eval source_process=mvindex(split(SourceImage, "\\"), -1)
+| eval target_process=mvindex(split(TargetImage, "\\"), -1)
+    ``` Exclude known legitimate cross-process thread creation ```
+# LEARNING: "| where NOT (...)" — Whitelist of processes that legitimately create remote threads
+#   These exclusions are critical to reduce false positives:
+#   - Windows system processes (csrss, wininit, services, etc.) do this as part of normal OS operation
+#   - AV/EDR products (MsMpEng = Defender, MsSense = Defender for Endpoint) inject monitoring hooks
+#   - Visual Studio debugger uses remote threads for debugging
+| where NOT (
+    ``` Windows native processes that legitimately create remote threads ```
+    match(SourceImage, "(?i)\\\\(csrss|wininit|services|smss|lsass|winlogon|svchost)\.exe$")
+    OR
+    ``` Common AV/EDR products ```
+    match(SourceImage, "(?i)\\\\(MsMpEng|MsSense|SenseIR|SecurityHealthService|AmSvc)\.exe$")
+    OR
+    ``` Visual Studio debugging ```
+    match(SourceImage, "(?i)\\\\(devenv|msvsmon|vshost).*\.exe$")
+    )
+    ``` Classify the injection target for risk assessment ```
+# LEARNING: Risk depends heavily on WHAT was injected into:
+#   lsass.exe = credential theft (attacker injecting to read passwords from memory)
+#   winlogon.exe = handles user logon — injection here can capture passwords at login
+#   csrss.exe = critical system process — injection here indicates kernel-level compromise
+#   svchost.exe = runs Windows services — injection blends into many instances
+#   explorer.exe = user desktop — injection here can keylog and monitor user activity
+#   Browsers = can steal cookies, session tokens, and form data
+| eval target_risk=case(
+    match(TargetImage, "(?i)\\\\lsass\.exe$"), "Critical - LSASS injection (credential theft)",
+    match(TargetImage, "(?i)\\\\winlogon\.exe$"), "Critical - Winlogon injection",
+    match(TargetImage, "(?i)\\\\csrss\.exe$"), "Critical - CSRSS injection",
+    match(TargetImage, "(?i)\\\\services\.exe$"), "Critical - Services.exe injection",
+    match(TargetImage, "(?i)\\\\svchost\.exe$"), "High - Svchost injection",
+    match(TargetImage, "(?i)\\\\explorer\.exe$"), "High - Explorer injection",
+    match(TargetImage, "(?i)\\\\(iexplore|chrome|firefox|edge|msedge)\.exe$"), "High - Browser injection",
+    1=1, "Medium - Process injection detected"
+    )
+    ``` Classify the injection source for suspiciousness ```
+# LEARNING: WHERE the injecting process lives also matters:
+#   Temp/Downloads = likely dropped malware (not installed software)
+#   LOLBins (PowerShell, rundll32, etc.) = legitimate tools weaponized for injection
+#   Scripting runtimes (Python, Java) = could be attacker scripts
+| eval source_risk=case(
+    match(SourceImage, "(?i)(\\\\temp\\\\|\\\\tmp\\\\|\\\\appdata\\\\|\\\\public\\\\|\\\\downloads\\\\)"), "Critical - Injection from temp/user directory",
+    match(SourceImage, "(?i)(powershell|cmd|wscript|cscript|mshta|rundll32)\.exe$"), "High - LOLBin performing injection",
+    match(SourceImage, "(?i)\\\\(python|ruby|perl|java)"), "Medium - Scripting runtime injection",
+    1=1, "Medium - Standard executable"
+    )
+# LEARNING: StartFunction and StartModule show what code runs in the injected thread
+#   These can reveal the DLL or function being loaded (e.g., LoadLibraryA for DLL injection)
+| eval start_function=coalesce(StartFunction, "Unknown")
+| eval start_module=coalesce(StartModule, "Unknown")
+    ``` Aggregate and correlate injection events ```
+# LEARNING: "| stats ... by Computer, SourceProcessId" — Groups by source PROCESS ID
+#   This clusters all injections from the SAME attacker process together
+#   dc(TargetImage) = distinct count of unique target processes
+#   One process injecting into MANY targets = automated injection campaign (very malicious)
+| stats count as injection_count
+        values(source_process) as source_processes
+        values(SourceImage) as source_paths
+        values(target_process) as target_processes
+        values(TargetImage) as target_paths
+        values(target_risk) as target_analysis
+        values(source_risk) as source_analysis
+        values(start_function) as start_functions
+        values(start_module) as start_modules
+        dc(TargetImage) as unique_targets
+        earliest(event_time) as first_seen
+        latest(event_time) as last_seen
+    by Computer, SourceProcessId
+    ``` Multiple injection targets from same source = strong indicator ```
+# LEARNING: Risk escalation logic:
+#   3+ unique targets from same source = injection campaign (Cobalt Strike-like behavior)
+#   Critical target (lsass, csrss) or critical source (temp dir) = immediate Critical
+#   Repeated injection (>5 times) = persistent injection attempts
+| eval overall_risk=case(
+    unique_targets >= 3, "Critical - Multi-process injection campaign",
+    match(target_analysis, "Critical"), "Critical",
+    match(source_analysis, "Critical"), "Critical",
+    injection_count > 5, "High - Repeated injection from same source",
+    1=1, "High"
+    )
+| sort - overall_risk, - injection_count
+# LEARNING: "| table" — Final output for SOC investigation
+#   Key fields: source_processes (what is injecting), target_processes (what is being injected),
+#   start_functions/start_modules (what code is being injected),
+#   unique_targets (breadth of injection — more = worse)
+| table Computer, source_processes, source_paths, target_processes, target_paths, start_functions, start_modules, source_analysis, target_analysis, injection_count, unique_targets, first_seen, last_seen, overall_risk

@@ -1,0 +1,58 @@
+title: Suspicious New Service Installation
+id: b8e0c5d9-6a1f-4b3c-c4d5-8f9e0a1b2c3d
+status: experimental
+level: medium
+description: |
+    Detects new Windows service installations via Event ID 7045 with suspicious
+    characteristics. Attackers create malicious services for persistence and
+    privilege escalation, as services run as SYSTEM by default. This rule flags
+    services with binary paths in user-writable directories, script interpreters
+    as service binaries, or known attack tool service names.
+references:
+    - https://attack.mitre.org/techniques/T1543/003/
+    - https://www.sans.org/blog/detecting-malicious-services/
+author: Kud Lee
+date: 2026/03/19
+tags:
+    - attack.persistence
+    - attack.privilege_escalation
+    - attack.t1543.003
+logsource:
+    product: windows
+    service: system
+detection:
+    selection:
+        EventID: 7045
+    filter_known_paths:
+        ImagePath|startswith:
+            - 'C:\Windows\System32\'
+            - 'C:\Program Files\'
+            - 'C:\Program Files (x86)\'
+    suspicious_path:
+        ImagePath|contains:
+            - '\Temp\'
+            - '\tmp\'
+            - '\AppData\'
+            - '\Users\'
+            - '\Public\'
+            - '\Downloads\'
+    suspicious_binary:
+        ImagePath|contains:
+            - 'cmd.exe'
+            - 'powershell.exe'
+            - 'pwsh.exe'
+            - 'mshta.exe'
+            - 'wscript.exe'
+            - 'cscript.exe'
+    suspicious_extension:
+        ImagePath|endswith:
+            - '.bat'
+            - '.ps1'
+            - '.vbs'
+            - '.js'
+            - '.hta'
+    condition: selection and (suspicious_path or suspicious_binary or suspicious_extension)
+falsepositives:
+    - Legitimate software installations creating services in non-standard paths
+    - Windows Updates installing new system services
+    - IT-deployed management agents and monitoring tools

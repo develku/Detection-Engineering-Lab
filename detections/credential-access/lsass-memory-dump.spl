@@ -1,0 +1,118 @@
+# Detection: LSASS Memory Dump via Process Access
+# ATT&CK: T1003.001 — OS Credential Dumping: LSASS Memory
+# Tactic: Credential Access
+# Log Source: Sysmon Event ID 10 (ProcessAccess)
+# Severity: Critical
+# Description: Detects suspicious process access to LSASS (lsass.exe) with
+#   GrantedAccess flags commonly used by credential dumping tools such as
+#   Mimikatz, ProcDump, and Task Manager memory dumps. LSASS holds plaintext
+#   passwords, Kerberos tickets, and NTLM hashes — accessing its memory is
+#   a primary objective for attackers performing credential theft.
+# False Positives:
+#   - Legitimate AV/EDR products accessing LSASS for protection
+#   - Windows Defender performing routine scans
+#   - WerFault.exe crash dump collection
+# References:
+#   - https://attack.mitre.org/techniques/T1003/001/
+#   - https://docs.microsoft.com/en-us/sysinternals/downloads/sysmon
+#
+# Usage: Copy this query into Splunk Search & Reporting
+# Required: Sysmon installed with ProcessAccess logging (Event ID 10) enabled
+#
+# ============================================================================
+# LEARNING NOTES — For SOC Analyst Study
+# ============================================================================
+#
+# LEARNING: WHAT THIS DETECTS AND WHY ATTACKERS DO IT
+#   LSASS (Local Security Authority Subsystem Service) is the Windows process
+#   responsible for enforcing security policy and handling authentication.
+#   It stores plaintext passwords, NTLM hashes, and Kerberos tickets in memory.
+#   Attackers target LSASS because dumping its memory gives them credentials
+#   they can use to move laterally across the network (pass-the-hash, pass-the-ticket).
+#   Tools like Mimikatz, ProcDump, and Task Manager can read LSASS memory.
+#
+# LEARNING: WHAT HAPPENS TECHNICALLY
+#   When a credential dumping tool runs, it calls the Windows API function
+#   OpenProcess() on lsass.exe with specific access rights (like PROCESS_VM_READ
+#   and PROCESS_QUERY_INFORMATION). These access rights are encoded as hex values
+#   in the GrantedAccess field. For example, Mimikatz typically requests 0x1010
+#   (PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION). Sysmon intercepts
+#   this API call and logs it as Event ID 10 (ProcessAccess).
+#
+# LEARNING: WHY SYSMON EVENT ID 10?
+#   Windows does not natively log process-to-process access. Sysmon Event ID 10
+#   (ProcessAccess) fires whenever one process opens a handle to another process.
+#   By filtering for TargetImage=lsass.exe with suspicious GrantedAccess values,
+#   we catch the exact moment an attacker's tool tries to read LSASS memory.
+# ============================================================================
+
+# LEARNING: "index=sysmon" — Search only the Sysmon log index in Splunk
+# LEARNING: "EventCode=10" — Filter for Sysmon ProcessAccess events specifically
+# LEARNING: "TargetImage="*\\lsass.exe"" — Only show events where the TARGET being accessed is LSASS
+index=sysmon EventCode=10 TargetImage="*\\lsass.exe"
+# LEARNING: "| eval" — Creates a new calculated field; here it lowercases the GrantedAccess hex string
+#   for consistent comparison (so "0x1FFFFF" and "0x1fffff" both match)
+| eval granted_hex=lower(GrantedAccess)
+    ``` Filter for access rights commonly abused by credential dumping tools ```
+# LEARNING: "| where ... IN (...)" — Keeps only rows where granted_hex matches one of these hex values
+#   0x1010  = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ (Mimikatz default)
+#   0x1038  = Includes PROCESS_VM_WRITE (more aggressive access)
+#   0x1fffff = PROCESS_ALL_ACCESS (full access — very suspicious)
+#   These specific hex codes are known signatures of credential dumping tools
+| where granted_hex IN ("0x1010", "0x1038", "0x1fffff", "0x1f0fff", "0x1f1fff", "0x143a", "0x1410", "0x40")
+    ``` Exclude known legitimate callers to reduce noise ```
+# LEARNING: "| search NOT [subsearch]" — Removes results matching a whitelist CSV lookup
+#   The subsearch (inside [ ]) loads a CSV of known-good programs that legitimately access LSASS,
+#   and the NOT keyword excludes them. This is a common false-positive reduction technique.
+| search NOT [
+    | inputlookup lsass_access_whitelist.csv
+    | fields SourceImage
+    | rename SourceImage as SourceImage
+    ]
+# LEARNING: "| where NOT match(SourceImage, regex)" — Second layer of exclusion using regex
+#   Filters out Windows system processes that normally access LSASS:
+#   csrss.exe (Client/Server Runtime), wininit.exe (Windows init), MsMpEng.exe (Defender), etc.
+#   "(?i)" makes the regex case-insensitive
+| where NOT match(SourceImage, "(?i)(csrss\.exe|wininit\.exe|wmiprvse\.exe|svchost\.exe|MsMpEng\.exe|SecurityHealthService\.exe)")
+    ``` Enrich with process context ```
+# LEARNING: "mvindex(split(SourceImage, "\\"), -1)" — Extracts just the filename from the full path
+#   split() breaks "C:\Tools\mimikatz.exe" into ["C:", "Tools", "mimikatz.exe"]
+#   mvindex(..., -1) grabs the last element: "mimikatz.exe"
+#   This makes the output table easier to read
+| eval source_process=mvindex(split(SourceImage, "\\"), -1)
+| eval target_process=mvindex(split(TargetImage, "\\"), -1)
+    ``` Statistical analysis for anomaly detection ```
+# LEARNING: "| stats" — Aggregates multiple events into summary rows (like SQL GROUP BY)
+#   count as access_count — How many times this process accessed LSASS
+#   earliest(_time)/latest(_time) — First and last time it happened
+#   values(GrantedAccess) — All unique access right hex codes used
+#   values(SourceImage) — All unique source process paths
+#   dc(GrantedAccess) — "dc" means "distinct count" — how many DIFFERENT access types were used
+#   by Computer, SourceProcessId, source_process — Group results by these fields
+| stats count as access_count
+        earliest(_time) as first_seen
+        latest(_time) as last_seen
+        values(GrantedAccess) as access_rights
+        values(SourceImage) as source_paths
+        dc(GrantedAccess) as unique_access_types
+    by Computer, SourceProcessId, source_process
+# LEARNING: "strftime" — Converts epoch timestamp to human-readable date format
+| eval first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S")
+| eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+    ``` Prioritize by risk indicators ```
+# LEARNING: "| eval ... = case(...)" — Creates a new field based on conditional logic (like if/else)
+#   Multiple LSASS accesses with different access types = likely credential dumping tool
+#   Source from temp/downloads/appdata = likely dropped malware (not installed software)
+| eval risk_score=case(
+    access_count > 5 AND unique_access_types > 1, "Critical",
+    match(source_paths, "(?i)(temp|appdata|public|downloads)"), "Critical",
+    access_count > 1, "High",
+    1=1, "Medium"
+    )
+# LEARNING: "| sort - access_count" — Sorts results descending (the "-" means descending)
+#   Most frequent LSASS accessors appear first
+| sort - access_count
+# LEARNING: "| table" — Selects which columns to display in the final output
+#   This is the last command, so these are the columns the SOC analyst reviews
+#   Computer = which machine, source_process = what accessed LSASS, risk_score = triage priority
+| table Computer, source_process, source_paths, access_rights, access_count, unique_access_types, first_seen, last_seen, risk_score

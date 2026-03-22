@@ -1,0 +1,123 @@
+# Detection: Windows Event Log Cleared
+# ATT&CK: T1070.001 — Indicator Removal: Clear Windows Event Logs
+# Tactic: Defense Evasion
+# Log Source: Windows Security Event 1102, Windows System Event 104
+# Severity: High
+# Description: Detects when Windows event logs are cleared, a common defense
+#   evasion technique used by attackers to destroy forensic evidence. Event 1102
+#   is generated when the Security log is cleared, and Event 104 is generated
+#   when any event log channel is cleared via wevtutil or Event Viewer. Log
+#   clearing is highly suspicious in production environments and should always
+#   be investigated, as it indicates an attacker is attempting to cover their
+#   tracks after malicious activity.
+# False Positives:
+#   - Authorized log maintenance by system administrators (should be rare)
+#   - Automated log rotation scripts (should use archival, not clearing)
+#   - System rebuilds or reimaging processes
+# References:
+#   - https://attack.mitre.org/techniques/T1070/001/
+#   - https://docs.microsoft.com/en-us/windows/security/threat-protection/auditing/event-1102
+#
+# Usage: Copy this query into Splunk Search & Reporting
+# Required: Windows Security and System event log forwarding enabled
+#
+# ============================================================================
+# LEARNING NOTES — For SOC Analyst Study
+# ============================================================================
+#
+# LEARNING: WHAT THIS DETECTS AND WHY ATTACKERS DO IT
+#   This detects when Windows event logs are CLEARED — a classic defense evasion
+#   technique. After completing their attack (stealing credentials, installing
+#   backdoors, exfiltrating data), attackers clear the logs to destroy evidence
+#   of their activities. Without logs, SOC analysts and incident responders
+#   cannot reconstruct what happened. This is often one of the LAST actions in
+#   an attack chain, meaning if you see log clearing, the attack is likely
+#   already complete and you need to investigate immediately.
+#
+# LEARNING: WHAT HAPPENS TECHNICALLY
+#   Attackers clear logs using commands like:
+#   - wevtutil cl Security (clears Security log)
+#   - wevtutil cl System (clears System log)
+#   - Clear-EventLog -LogName Security (PowerShell)
+#   - Or via Event Viewer GUI → right-click → "Clear Log..."
+#   Ironically, the act of clearing the Security log generates one FINAL event
+#   (Event 1102) before the log is wiped — this is our detection opportunity.
+#   It is like a burglar tripping the alarm while trying to disable the camera.
+#
+# LEARNING: WHY EVENTS 1102 AND 104?
+#   Event 1102 is special: it fires in the Security log when the Security log itself
+#   is cleared. It is the LAST event written before the log is wiped.
+#   Event 104 fires in the System log when ANY event log channel is cleared
+#   (Security, System, Application, or custom logs).
+#   Together, these two events catch ALL log clearing attempts.
+# ============================================================================
+
+# LEARNING: Two searches combined with OR to catch both event types
+#   Note the parentheses — this is a "search-time OR" combining two different sourcetypes/events
+(index=wineventlog sourcetype="WinEventLog:Security" EventCode=1102)
+OR (index=wineventlog sourcetype="WinEventLog:System" EventCode=104)
+| eval event_time=strftime(_time, "%Y-%m-%d %H:%M:%S")
+# LEARNING: Time context extraction for anomaly detection
+#   %H = hour (0-23), %A = full day name (Monday, Tuesday, etc.)
+| eval hour_of_day=strftime(_time, "%H")
+| eval day_of_week=strftime(_time, "%A")
+    ``` Normalize the actor fields across event types ```
+# LEARNING: Different event types store the actor in different fields
+#   Event 1102 uses SubjectUserName; Event 104 may use param1
+#   case() handles this normalization so we have a single "cleared_by" field
+| eval cleared_by=case(
+    EventCode=1102, coalesce(SubjectUserName, "Unknown"),
+    EventCode=104, coalesce(SubjectUserName, param1, "Unknown"),
+    1=1, "Unknown"
+    )
+| eval cleared_domain=coalesce(SubjectDomainName, "Unknown")
+# LEARNING: Identifies WHICH log was cleared — Security log clearing is most critical
+#   because Security logs contain logon events, privilege use, and access auditing
+| eval log_cleared=case(
+    EventCode=1102, "Security Log",
+    EventCode=104, coalesce(Channel, param1, "System/Application Log"),
+    1=1, "Unknown"
+    )
+| eval clear_method=case(
+    EventCode=1102, "Security audit log was cleared (1102)",
+    EventCode=104, "Event log was cleared (104)",
+    1=1, "Unknown"
+    )
+    ``` Risk assessment ```
+# LEARNING: Risk is based on WHAT was cleared and WHEN:
+#   Security Log cleared = Critical (destroys the primary forensic evidence source)
+#   Off-hours/weekend = Higher risk (legitimate maintenance usually happens during business hours)
+| eval risk_level=case(
+    log_cleared="Security Log", "Critical - Security audit trail destroyed",
+    hour_of_day < 6 OR hour_of_day > 22, "High - Log clearing during off-hours",
+    day_of_week="Saturday" OR day_of_week="Sunday", "High - Weekend log clearing",
+    1=1, "High - Event log cleared"
+    )
+    ``` Check for rapid successive log clearing (multiple logs cleared in short window) ```
+# LEARNING: "| stats ... by Computer, cleared_by" — Groups all log clearing by who did it
+#   values(log_cleared) = shows which logs were cleared (Security AND System = thorough cleanup)
+#   count = how many logs were cleared (more = more suspicious)
+| stats count as logs_cleared
+        values(log_cleared) as cleared_logs
+        values(clear_method) as methods
+        values(risk_level) as risk_assessment
+        values(hour_of_day) as hours
+        values(day_of_week) as days
+        earliest(event_time) as first_clear
+        latest(event_time) as last_clear
+    by Computer, cleared_by, cleared_domain
+    ``` Multiple log clearings by same actor = higher confidence of malicious activity ```
+# LEARNING: If someone cleared more than 2 log sources, they are systematically destroying
+#   evidence — this is a strong indicator of post-compromise cleanup
+| eval overall_risk=case(
+    logs_cleared > 2, "Critical - Multiple logs cleared (evidence destruction pattern)",
+    match(risk_assessment, "Critical"), "Critical",
+    1=1, "High"
+    )
+| sort - overall_risk, - logs_cleared
+# LEARNING: "| table" — Final output for SOC investigation
+#   Key fields: cleared_by (who did it), cleared_logs (what was destroyed),
+#   hours + days (when it happened — off-hours is more suspicious)
+#   IMPORTANT: Even "High" risk log clearing should be investigated — there are
+#   very few legitimate reasons to clear event logs in a production environment
+| table Computer, cleared_domain, cleared_by, cleared_logs, methods, logs_cleared, hours, days, first_clear, last_clear, overall_risk

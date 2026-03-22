@@ -1,0 +1,242 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<dashboard version="1.1" theme="dark">
+  <label>Authentication Overview</label>
+  <description>Monitor authentication events across the domain. Track failed logons, lockouts, and suspicious authentication patterns. | ATT&amp;CK: T1078 (Valid Accounts), T1110 (Brute Force)</description>
+
+  <!-- ============================================================
+       Dashboard: Authentication Overview
+       Author: Kud Lee
+       Created: 2026-03-19
+       Log Sources: Windows Security Event Log (EventCode 4624, 4625, 4740)
+       Index: wineventlog
+       Purpose: Provide SOC analysts with a centralized view of authentication
+                activity to identify brute-force attempts, credential stuffing,
+                password spraying, and compromised accounts.
+       ============================================================ -->
+
+  <fieldset submitButton="true" autoRun="true">
+    <input type="time" token="time_range" searchWhenChanged="true">
+      <label>Time Range</label>
+      <default>
+        <earliest>-24h@h</earliest>
+        <latest>now</latest>
+      </default>
+    </input>
+    <input type="dropdown" token="src_host" searchWhenChanged="true">
+      <label>Source Host</label>
+      <choice value="*">All Hosts</choice>
+      <default>*</default>
+      <search>
+        <query>index=wineventlog EventCode IN (4624, 4625) earliest=-24h | stats count by ComputerName | sort - count</query>
+      </search>
+      <fieldForLabel>ComputerName</fieldForLabel>
+      <fieldForValue>ComputerName</fieldForValue>
+    </input>
+    <input type="text" token="target_account" searchWhenChanged="false">
+      <label>Target Account (wildcard supported)</label>
+      <default>*</default>
+    </input>
+  </fieldset>
+
+  <!-- ===================== ROW 1: Summary Stats ===================== -->
+  <row>
+    <panel>
+      <title>Total Failed Logins</title>
+      <single>
+        <search>
+          <query>index=wineventlog EventCode=4625 ComputerName=$src_host$ TargetUserName=$target_account$
+| stats count as total_failures</query>
+          <earliest>$time_range.earliest$</earliest>
+          <latest>$time_range.latest$</latest>
+        </search>
+        <option name="colorBy">value</option>
+        <option name="rangeColors">["0x65a637","0xf8be34","0xd93f3c"]</option>
+        <option name="rangeValues">[50,200]</option>
+        <option name="useColors">true</option>
+        <option name="drilldown">all</option>
+      </single>
+    </panel>
+    <panel>
+      <title>Total Successful Logins</title>
+      <single>
+        <search>
+          <query>index=wineventlog EventCode=4624 ComputerName=$src_host$ TargetUserName=$target_account$
+| stats count as total_success</query>
+          <earliest>$time_range.earliest$</earliest>
+          <latest>$time_range.latest$</latest>
+        </search>
+        <option name="colorBy">value</option>
+        <option name="useColors">false</option>
+      </single>
+    </panel>
+    <panel>
+      <title>Account Lockouts</title>
+      <single>
+        <search>
+          <query>index=wineventlog EventCode=4740 ComputerName=$src_host$
+| stats count as lockout_count</query>
+          <earliest>$time_range.earliest$</earliest>
+          <latest>$time_range.latest$</latest>
+        </search>
+        <option name="colorBy">value</option>
+        <option name="rangeColors">["0x65a637","0xf8be34","0xd93f3c"]</option>
+        <option name="rangeValues">[5,20]</option>
+        <option name="useColors">true</option>
+      </single>
+    </panel>
+    <panel>
+      <title>Unique Accounts Targeted</title>
+      <single>
+        <search>
+          <query>index=wineventlog EventCode=4625 ComputerName=$src_host$
+| stats dc(TargetUserName) as unique_accounts</query>
+          <earliest>$time_range.earliest$</earliest>
+          <latest>$time_range.latest$</latest>
+        </search>
+      </single>
+    </panel>
+  </row>
+
+  <!-- ===================== ROW 2: Failed Logins Over Time ===================== -->
+  <row>
+    <panel>
+      <title>Failed Logins Over Time</title>
+      <chart>
+        <search>
+          <query>index=wineventlog EventCode=4625 ComputerName=$src_host$ TargetUserName=$target_account$
+| timechart span=1h count as "Failed Logins" by TargetUserName limit=10 useother=false</query>
+          <earliest>$time_range.earliest$</earliest>
+          <latest>$time_range.latest$</latest>
+        </search>
+        <option name="charting.chart">area</option>
+        <option name="charting.chart.stackMode">stacked</option>
+        <option name="charting.axisTitleX.text">Time</option>
+        <option name="charting.axisTitleY.text">Failed Login Count</option>
+        <option name="charting.legend.placement">right</option>
+        <option name="charting.chart.nullValueMode">zero</option>
+        <option name="drilldown">all</option>
+      </chart>
+    </panel>
+  </row>
+
+  <!-- ===================== ROW 3: Top Failures + Logon Type ===================== -->
+  <row>
+    <panel>
+      <title>Top 10 Accounts with Failed Logins</title>
+      <chart>
+        <search>
+          <query>index=wineventlog EventCode=4625 ComputerName=$src_host$ TargetUserName=$target_account$
+| stats count as failure_count by TargetUserName
+| sort - failure_count
+| head 10</query>
+          <earliest>$time_range.earliest$</earliest>
+          <latest>$time_range.latest$</latest>
+        </search>
+        <option name="charting.chart">bar</option>
+        <option name="charting.axisTitleX.text">Failed Login Count</option>
+        <option name="charting.axisTitleY.text">Account</option>
+        <option name="charting.chart.showDataLabels">all</option>
+        <option name="charting.legend.placement">none</option>
+        <option name="drilldown">all</option>
+      </chart>
+    </panel>
+    <panel>
+      <title>Logon Type Distribution</title>
+      <chart>
+        <search>
+          <query>index=wineventlog EventCode IN (4624, 4625) ComputerName=$src_host$
+| eval LogonTypeDesc=case(
+    LogonType=2, "2 - Interactive",
+    LogonType=3, "3 - Network",
+    LogonType=4, "4 - Batch",
+    LogonType=5, "5 - Service",
+    LogonType=7, "7 - Unlock",
+    LogonType=8, "8 - NetworkCleartext",
+    LogonType=9, "9 - NewCredentials",
+    LogonType=10, "10 - RemoteInteractive (RDP)",
+    LogonType=11, "11 - CachedInteractive",
+    1=1, LogonType." - Unknown"
+    )
+| stats count by LogonTypeDesc
+| sort - count</query>
+          <earliest>$time_range.earliest$</earliest>
+          <latest>$time_range.latest$</latest>
+        </search>
+        <option name="charting.chart">pie</option>
+        <option name="charting.chart.showPercent">true</option>
+        <option name="charting.legend.placement">right</option>
+        <option name="drilldown">all</option>
+      </chart>
+    </panel>
+  </row>
+
+  <!-- ===================== ROW 4: Success After Failures ===================== -->
+  <row>
+    <panel>
+      <title>Successful Logins After Multiple Failures (Possible Brute-Force Success)</title>
+      <table>
+        <search>
+          <query>index=wineventlog EventCode IN (4624, 4625) ComputerName=$src_host$ TargetUserName=$target_account$
+| eval status=if(EventCode=4624, "Success", "Failure")
+| stats
+    count(eval(status="Failure")) as failures
+    count(eval(status="Success")) as successes
+    earliest(eval(if(status="Success", _time, null()))) as first_success
+    latest(eval(if(status="Failure", _time, null()))) as last_failure
+    values(IpAddress) as source_ips
+    values(LogonType) as logon_types
+    by TargetUserName, ComputerName
+| where failures >= 5 AND successes > 0
+| eval first_success=strftime(first_success, "%Y-%m-%d %H:%M:%S")
+| eval last_failure=strftime(last_failure, "%Y-%m-%d %H:%M:%S")
+| eval risk=case(
+    failures >= 20 AND successes > 0, "CRITICAL",
+    failures >= 10 AND successes > 0, "HIGH",
+    failures >= 5 AND successes > 0, "MEDIUM",
+    1=1, "LOW"
+    )
+| sort - failures
+| table TargetUserName, ComputerName, failures, successes, source_ips, logon_types, last_failure, first_success, risk
+| rename TargetUserName as "Account", ComputerName as "Host", failures as "Failed Attempts", successes as "Successful Logins", source_ips as "Source IPs", logon_types as "Logon Types", last_failure as "Last Failure", first_success as "First Success", risk as "Risk Level"</query>
+          <earliest>$time_range.earliest$</earliest>
+          <latest>$time_range.latest$</latest>
+        </search>
+        <option name="count">20</option>
+        <option name="drilldown">row</option>
+        <option name="refresh.display">progressbar</option>
+        <format type="color" field="Risk Level">
+          <colorPalette type="map">{"CRITICAL":#DC4E41,"HIGH":#F1813F,"MEDIUM":#F8BE34,"LOW":#65A637}</colorPalette>
+        </format>
+      </table>
+    </panel>
+  </row>
+
+  <!-- ===================== ROW 5: Account Lockouts ===================== -->
+  <row>
+    <panel>
+      <title>Account Lockouts (Event 4740)</title>
+      <table>
+        <search>
+          <query>index=wineventlog EventCode=4740 ComputerName=$src_host$
+| eval lockout_time=strftime(_time, "%Y-%m-%d %H:%M:%S")
+| stats
+    count as lockout_count
+    earliest(_time) as first_lockout
+    latest(_time) as last_lockout
+    values(TargetDomainName) as domain
+    by TargetUserName, ComputerName
+| eval first_lockout=strftime(first_lockout, "%Y-%m-%d %H:%M:%S")
+| eval last_lockout=strftime(last_lockout, "%Y-%m-%d %H:%M:%S")
+| sort - lockout_count
+| table TargetUserName, domain, ComputerName, lockout_count, first_lockout, last_lockout
+| rename TargetUserName as "Locked Account", domain as "Domain", ComputerName as "DC Reporting", lockout_count as "Lockout Events", first_lockout as "First Lockout", last_lockout as "Last Lockout"</query>
+          <earliest>$time_range.earliest$</earliest>
+          <latest>$time_range.latest$</latest>
+        </search>
+        <option name="count">20</option>
+        <option name="drilldown">row</option>
+        <option name="refresh.display">progressbar</option>
+      </table>
+    </panel>
+  </row>
+</dashboard>

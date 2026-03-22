@@ -1,0 +1,225 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<dashboard version="1.1" theme="dark">
+  <label>Alert Summary</label>
+  <description>SOC operator overview of detection alerts by severity, trend, and rule. Designed for shift handoffs and daily triage. | SIEM Detection Lab</description>
+
+  <!-- ============================================================
+       Dashboard: Alert Summary
+       Author: Kud Lee
+       Created: 2026-03-19
+       Log Sources: Splunk triggered alerts (index=_audit OR custom alert index)
+       Purpose: Give SOC operators a single-pane view of alert volume,
+                severity distribution, trending rules, and critical alerts
+                requiring immediate attention. Useful for shift handoffs
+                and daily standup reporting.
+       Note: This dashboard uses a custom "alerts" index populated by
+             Splunk alert actions. Adjust index/sourcetype as needed
+             for your environment.
+       ============================================================ -->
+
+  <fieldset submitButton="true" autoRun="true">
+    <input type="time" token="time_range" searchWhenChanged="true">
+      <label>Time Range</label>
+      <default>
+        <earliest>-24h@h</earliest>
+        <latest>now</latest>
+      </default>
+    </input>
+    <input type="dropdown" token="severity_filter" searchWhenChanged="true">
+      <label>Severity</label>
+      <choice value="*">All Severities</choice>
+      <choice value="critical">Critical</choice>
+      <choice value="high">High</choice>
+      <choice value="medium">Medium</choice>
+      <choice value="low">Low</choice>
+      <choice value="informational">Informational</choice>
+      <default>*</default>
+    </input>
+  </fieldset>
+
+  <!-- ===================== ROW 1: Summary Single Values ===================== -->
+  <row>
+    <panel>
+      <title>Critical Alerts</title>
+      <single>
+        <search>
+          <query>index=alerts severity="critical"
+| stats count as critical_count</query>
+          <earliest>$time_range.earliest$</earliest>
+          <latest>$time_range.latest$</latest>
+        </search>
+        <option name="colorBy">value</option>
+        <option name="rangeColors">["0x65a637","0xd93f3c"]</option>
+        <option name="rangeValues">[0]</option>
+        <option name="useColors">true</option>
+        <option name="underLabel">CRITICAL</option>
+      </single>
+    </panel>
+    <panel>
+      <title>High Alerts</title>
+      <single>
+        <search>
+          <query>index=alerts severity="high"
+| stats count as high_count</query>
+          <earliest>$time_range.earliest$</earliest>
+          <latest>$time_range.latest$</latest>
+        </search>
+        <option name="colorBy">value</option>
+        <option name="rangeColors">["0x65a637","0xf1813f"]</option>
+        <option name="rangeValues">[0]</option>
+        <option name="useColors">true</option>
+        <option name="underLabel">HIGH</option>
+      </single>
+    </panel>
+    <panel>
+      <title>Medium Alerts</title>
+      <single>
+        <search>
+          <query>index=alerts severity="medium"
+| stats count as medium_count</query>
+          <earliest>$time_range.earliest$</earliest>
+          <latest>$time_range.latest$</latest>
+        </search>
+        <option name="colorBy">value</option>
+        <option name="rangeColors">["0x65a637","0xf8be34"]</option>
+        <option name="rangeValues">[0]</option>
+        <option name="useColors">true</option>
+        <option name="underLabel">MEDIUM</option>
+      </single>
+    </panel>
+    <panel>
+      <title>Low / Informational</title>
+      <single>
+        <search>
+          <query>index=alerts severity IN ("low", "informational")
+| stats count as low_count</query>
+          <earliest>$time_range.earliest$</earliest>
+          <latest>$time_range.latest$</latest>
+        </search>
+        <option name="useColors">false</option>
+        <option name="underLabel">LOW / INFO</option>
+      </single>
+    </panel>
+    <panel>
+      <title>Total Alerts</title>
+      <single>
+        <search>
+          <query>index=alerts severity=$severity_filter$
+| stats count as total_alerts</query>
+          <earliest>$time_range.earliest$</earliest>
+          <latest>$time_range.latest$</latest>
+        </search>
+        <option name="useColors">false</option>
+        <option name="underLabel">TOTAL</option>
+      </single>
+    </panel>
+  </row>
+
+  <!-- ===================== ROW 2: Alert Count by Severity ===================== -->
+  <row>
+    <panel>
+      <title>Alert Count by Severity</title>
+      <chart>
+        <search>
+          <query>index=alerts severity=$severity_filter$
+| eval severity_order=case(
+    severity="critical", 1,
+    severity="high", 2,
+    severity="medium", 3,
+    severity="low", 4,
+    severity="informational", 5,
+    1=1, 6
+    )
+| stats count by severity, severity_order
+| sort severity_order
+| fields - severity_order</query>
+          <earliest>$time_range.earliest$</earliest>
+          <latest>$time_range.latest$</latest>
+        </search>
+        <option name="charting.chart">bar</option>
+        <option name="charting.axisTitleX.text">Severity</option>
+        <option name="charting.axisTitleY.text">Alert Count</option>
+        <option name="charting.chart.showDataLabels">all</option>
+        <option name="charting.legend.placement">none</option>
+        <option name="charting.fieldColors">{"critical":#DC4E41,"high":#F1813F,"medium":#F8BE34,"low":#65A637,"informational":#006D9C}</option>
+      </chart>
+    </panel>
+  </row>
+
+  <!-- ===================== ROW 3: Alert Trend Over Time ===================== -->
+  <row>
+    <panel>
+      <title>Alert Trend Over Time</title>
+      <chart>
+        <search>
+          <query>index=alerts severity=$severity_filter$
+| timechart span=1h count by severity</query>
+          <earliest>$time_range.earliest$</earliest>
+          <latest>$time_range.latest$</latest>
+        </search>
+        <option name="charting.chart">area</option>
+        <option name="charting.chart.stackMode">stacked</option>
+        <option name="charting.axisTitleX.text">Time</option>
+        <option name="charting.axisTitleY.text">Alert Count</option>
+        <option name="charting.legend.placement">right</option>
+        <option name="charting.chart.nullValueMode">zero</option>
+        <option name="charting.fieldColors">{"critical":#DC4E41,"high":#F1813F,"medium":#F8BE34,"low":#65A637,"informational":#006D9C}</option>
+      </chart>
+    </panel>
+  </row>
+
+  <!-- ===================== ROW 4: Top Triggered Detection Rules ===================== -->
+  <row>
+    <panel>
+      <title>Top Triggered Detection Rules</title>
+      <chart>
+        <search>
+          <query>index=alerts severity=$severity_filter$
+| stats count as trigger_count by rule_name, severity
+| sort - trigger_count
+| head 15</query>
+          <earliest>$time_range.earliest$</earliest>
+          <latest>$time_range.latest$</latest>
+        </search>
+        <option name="charting.chart">bar</option>
+        <option name="charting.axisTitleX.text">Trigger Count</option>
+        <option name="charting.axisTitleY.text">Detection Rule</option>
+        <option name="charting.chart.showDataLabels">all</option>
+        <option name="charting.legend.placement">right</option>
+        <option name="charting.fieldColors">{"critical":#DC4E41,"high":#F1813F,"medium":#F8BE34,"low":#65A637,"informational":#006D9C}</option>
+        <option name="drilldown">all</option>
+      </chart>
+    </panel>
+  </row>
+
+  <!-- ===================== ROW 5: Recent Critical Alerts ===================== -->
+  <row>
+    <panel>
+      <title>Recent Critical Alerts (Requires Immediate Attention)</title>
+      <table>
+        <search>
+          <query>index=alerts severity IN ("critical", "high")
+| eval alert_time=strftime(_time, "%Y-%m-%d %H:%M:%S")
+| eval time_ago=tostring(now()-_time, "duration")
+| eval mitre_tactic=coalesce(mitre_tactic, "Unknown")
+| eval mitre_technique=coalesce(mitre_technique, "Unknown")
+| eval affected_host=coalesce(host, dest, src, "Unknown")
+| eval affected_user=coalesce(user, src_user, "Unknown")
+| table alert_time, time_ago, severity, rule_name, mitre_tactic, mitre_technique, affected_host, affected_user, description
+| rename alert_time as "Time", time_ago as "Age", severity as "Severity", rule_name as "Rule Name", mitre_tactic as "MITRE Tactic", mitre_technique as "MITRE Technique", affected_host as "Host", affected_user as "User", description as "Description"
+| sort - Time
+| head 25</query>
+          <earliest>$time_range.earliest$</earliest>
+          <latest>$time_range.latest$</latest>
+        </search>
+        <option name="count">20</option>
+        <option name="drilldown">row</option>
+        <option name="wrap">true</option>
+        <option name="refresh.display">progressbar</option>
+        <format type="color" field="Severity">
+          <colorPalette type="map">{"critical":#DC4E41,"high":#F1813F}</colorPalette>
+        </format>
+      </table>
+    </panel>
+  </row>
+</dashboard>

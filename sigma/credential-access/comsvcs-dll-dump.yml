@@ -1,0 +1,43 @@
+title: LSASS Dump via comsvcs.dll MiniDump
+id: b2e4c9d3-0a5f-4b7c-c8d9-2f3e4a5b6c7d
+status: experimental
+level: critical
+description: |
+    Detects the abuse of comsvcs.dll MiniDump export function via rundll32.exe
+    to dump LSASS process memory. This living-off-the-land technique avoids
+    dropping known malicious tools to disk. Attackers commonly use the command:
+    rundll32.exe C:\Windows\System32\comsvcs.dll MiniDump <PID> out.dmp full
+references:
+    - https://attack.mitre.org/techniques/T1003/001/
+    - https://lolbas-project.github.io/lolbas/Libraries/Comsvcs/
+author: Kud Lee
+date: 2026/03/19
+tags:
+    - attack.credential_access
+    - attack.t1003.001
+logsource:
+    category: process_creation
+    product: windows
+detection:
+    selection_rundll32:
+        EventID: 1
+        Image|endswith: '\rundll32.exe'
+        CommandLine|contains|all:
+            - 'comsvcs'
+            - 'MiniDump'
+    selection_ordinal:
+        EventID: 1
+        Image|endswith: '\rundll32.exe'
+        CommandLine|contains|all:
+            - 'comsvcs'
+            - '#24'
+    selection_full_dump:
+        EventID: 1
+        Image|endswith: '\rundll32.exe'
+        CommandLine|contains|all:
+            - 'comsvcs'
+            - 'full'
+    condition: selection_rundll32 or selection_ordinal or selection_full_dump
+falsepositives:
+    - Very unlikely in legitimate environments
+    - Possible during authorized penetration testing

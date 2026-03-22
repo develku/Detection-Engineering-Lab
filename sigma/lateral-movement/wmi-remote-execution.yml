@@ -1,0 +1,53 @@
+title: WMI Remote Process Execution
+id: a7d9b4c8-5f0e-4a2b-b3c4-7e8d9f0a1b2c
+status: experimental
+level: high
+description: |
+    Detects remote process execution via Windows Management Instrumentation (WMI).
+    Monitors for wmiprvse.exe spawning suspicious child processes (indicating
+    remote WMI command execution), wmic.exe with /node: parameter targeting
+    remote hosts, and PowerShell WMI/CIM method invocations. WMI lateral
+    movement is stealthy as it uses built-in Windows functionality.
+references:
+    - https://attack.mitre.org/techniques/T1047/
+    - https://www.fireeye.com/blog/threat-research/2017/03/wmimplant_a_wmi_ba.html
+author: Kud Lee
+date: 2026/03/19
+tags:
+    - attack.lateral_movement
+    - attack.execution
+    - attack.t1047
+logsource:
+    category: process_creation
+    product: windows
+detection:
+    selection_wmiprvse_children:
+        EventID: 1
+        ParentImage|endswith: '\wmiprvse.exe'
+        Image|endswith:
+            - '\cmd.exe'
+            - '\powershell.exe'
+            - '\pwsh.exe'
+            - '\mshta.exe'
+            - '\cscript.exe'
+            - '\wscript.exe'
+            - '\rundll32.exe'
+            - '\regsvr32.exe'
+    selection_wmic_remote:
+        EventID: 1
+        Image|endswith: '\wmic.exe'
+        CommandLine|contains: '/node:'
+    selection_powershell_wmi:
+        EventID: 1
+        Image|endswith:
+            - '\powershell.exe'
+            - '\pwsh.exe'
+        CommandLine|contains:
+            - 'Invoke-WmiMethod'
+            - 'Invoke-CimMethod'
+            - 'Win32_Process'
+    condition: selection_wmiprvse_children or selection_wmic_remote or selection_powershell_wmi
+falsepositives:
+    - SCCM/ConfigMgr using WMI for system inventory and management
+    - Monitoring tools querying WMI for system health
+    - Legitimate administrative PowerShell scripts using WMI

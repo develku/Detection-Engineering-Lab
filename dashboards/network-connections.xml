@@ -1,0 +1,189 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<dashboard version="1.1" theme="dark">
+  <label>Network Connections</label>
+  <description>Monitor outbound connections, DNS activity, and non-standard port usage across endpoints. | ATT&amp;CK: T1071 (Application Layer Protocol), T1571 (Non-Standard Port), T1048 (Exfiltration Over Alternative Protocol)</description>
+
+  <!-- ============================================================
+       Dashboard: Network Connections
+       Author: Kud Lee
+       Created: 2026-03-19
+       Log Sources: Sysmon Event ID 3 (NetworkConnect), Event ID 22 (DNSEvent)
+       Index: sysmon
+       Purpose: Identify C2 communication, data exfiltration, DNS tunneling,
+                and lateral movement by analyzing network and DNS telemetry.
+       ============================================================ -->
+
+  <fieldset submitButton="true" autoRun="true">
+    <input type="time" token="time_range" searchWhenChanged="true">
+      <label>Time Range</label>
+      <default>
+        <earliest>-24h@h</earliest>
+        <latest>now</latest>
+      </default>
+    </input>
+    <input type="dropdown" token="host_filter" searchWhenChanged="true">
+      <label>Host</label>
+      <choice value="*">All Hosts</choice>
+      <default>*</default>
+      <search>
+        <query>index=sysmon EventCode IN (3, 22) earliest=-24h | stats count by Computer | sort - count</query>
+      </search>
+      <fieldForLabel>Computer</fieldForLabel>
+      <fieldForValue>Computer</fieldForValue>
+    </input>
+    <input type="text" token="process_filter" searchWhenChanged="false">
+      <label>Process Name (wildcard)</label>
+      <default>*</default>
+    </input>
+  </fieldset>
+
+  <!-- ===================== ROW 1: Outbound Connections by Process ===================== -->
+  <row>
+    <panel>
+      <title>Outbound Connections by Process (Sysmon Event 3)</title>
+      <table>
+        <search>
+          <query>index=sysmon EventCode=3 Initiated=true Computer=$host_filter$
+| eval process_name=mvindex(split(Image, "\\"), -1)
+| search process_name=$process_filter$
+| where NOT cidrmatch("10.0.0.0/8", DestinationIp)
+    AND NOT cidrmatch("172.16.0.0/12", DestinationIp)
+    AND NOT cidrmatch("192.168.0.0/16", DestinationIp)
+    AND NOT cidrmatch("127.0.0.0/8", DestinationIp)
+| stats
+    count as connection_count
+    dc(DestinationIp) as unique_destinations
+    dc(DestinationPort) as unique_ports
+    values(DestinationPort) as dest_ports
+    latest(DestinationIp) as last_dest_ip
+    latest(_time) as last_seen
+    by Computer, process_name, Image, User
+| eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+| eval risk=case(
+    connection_count > 100 AND unique_destinations > 10, "HIGH",
+    unique_ports > 5, "HIGH",
+    match(Image, "(?i)(temp|appdata|public|downloads)"), "HIGH",
+    connection_count > 50, "MEDIUM",
+    1=1, "LOW"
+    )
+| sort - connection_count
+| table Computer, process_name, User, connection_count, unique_destinations, unique_ports, dest_ports, last_dest_ip, last_seen, risk
+| rename Computer as "Host", process_name as "Process", User as "User", connection_count as "Connections", unique_destinations as "Unique Dest IPs", unique_ports as "Unique Ports", dest_ports as "Destination Ports", last_dest_ip as "Last Dest IP", last_seen as "Last Seen", risk as "Risk"
+| head 50</query>
+          <earliest>$time_range.earliest$</earliest>
+          <latest>$time_range.latest$</latest>
+        </search>
+        <option name="count">20</option>
+        <option name="drilldown">row</option>
+        <format type="color" field="Risk">
+          <colorPalette type="map">{"HIGH":#DC4E41,"MEDIUM":#F8BE34,"LOW":#65A637}</colorPalette>
+        </format>
+      </table>
+    </panel>
+  </row>
+
+  <!-- ===================== ROW 2: DNS Query Volume Over Time ===================== -->
+  <row>
+    <panel>
+      <title>DNS Query Volume Over Time (Sysmon Event 22)</title>
+      <chart>
+        <search>
+          <query>index=sysmon EventCode=22 Computer=$host_filter$
+| timechart span=1h count as "DNS Queries" by Computer limit=10 useother=false</query>
+          <earliest>$time_range.earliest$</earliest>
+          <latest>$time_range.latest$</latest>
+        </search>
+        <option name="charting.chart">line</option>
+        <option name="charting.axisTitleX.text">Time</option>
+        <option name="charting.axisTitleY.text">Query Count</option>
+        <option name="charting.legend.placement">right</option>
+        <option name="charting.chart.nullValueMode">zero</option>
+      </chart>
+    </panel>
+  </row>
+
+  <!-- ===================== ROW 3: Top DNS Domains ===================== -->
+  <row>
+    <panel>
+      <title>Top DNS Domains Queried (Sysmon Event 22)</title>
+      <table>
+        <search>
+          <query>index=sysmon EventCode=22 Computer=$host_filter$
+| rex field=QueryName "(?&lt;top_domain&gt;[^\.]+\.[^\.]+)$"
+| where isnotnull(top_domain)
+    AND NOT match(top_domain, "(?i)(microsoft\.com|windowsupdate\.com|windows\.net|bing\.com|msftconnecttest\.com|office\.com|office365\.com|live\.com|azure\.com|digicert\.com|symantec\.com|verisign\.com|akamai\.net|cloudflare\.com|amazonaws\.com)")
+| stats
+    count as query_count
+    dc(QueryName) as unique_subdomains
+    dc(Computer) as hosts_querying
+    values(Computer) as querying_hosts
+    latest(Image) as last_process
+    by top_domain
+| eval subdomain_ratio=round(unique_subdomains/query_count, 4)
+| eval risk=case(
+    unique_subdomains > 50 AND subdomain_ratio > 0.8, "HIGH - Possible DNS Tunneling",
+    query_count > 500, "MEDIUM - High Volume",
+    hosts_querying=1 AND query_count > 20, "MEDIUM - Single Host",
+    1=1, "LOW"
+    )
+| sort - query_count
+| table top_domain, query_count, unique_subdomains, subdomain_ratio, hosts_querying, querying_hosts, last_process, risk
+| rename top_domain as "Domain", query_count as "Queries", unique_subdomains as "Unique Subdomains", subdomain_ratio as "Subdomain Ratio", hosts_querying as "Hosts Querying", querying_hosts as "Host List", last_process as "Last Process", risk as "Risk Assessment"
+| head 50</query>
+          <earliest>$time_range.earliest$</earliest>
+          <latest>$time_range.latest$</latest>
+        </search>
+        <option name="count">20</option>
+        <option name="drilldown">row</option>
+        <option name="wrap">true</option>
+        <format type="color" field="Risk Assessment">
+          <colorPalette type="map">{"HIGH - Possible DNS Tunneling":#DC4E41,"MEDIUM - High Volume":#F8BE34,"MEDIUM - Single Host":#F8BE34,"LOW":#65A637}</colorPalette>
+        </format>
+      </table>
+    </panel>
+  </row>
+
+  <!-- ===================== ROW 4: Connections to Non-Standard Ports ===================== -->
+  <row>
+    <panel>
+      <title>Connections to Non-Standard Ports (Sysmon Event 3)</title>
+      <table>
+        <search>
+          <query>index=sysmon EventCode=3 Initiated=true Computer=$host_filter$
+| where NOT DestinationPort IN (80, 443, 53, 445, 135, 139, 389, 636, 88, 3389, 5985, 5986, 8080, 8443, 123, 25, 587, 993, 995, 110, 143)
+| where NOT cidrmatch("10.0.0.0/8", DestinationIp)
+    AND NOT cidrmatch("172.16.0.0/12", DestinationIp)
+    AND NOT cidrmatch("192.168.0.0/16", DestinationIp)
+    AND NOT cidrmatch("127.0.0.0/8", DestinationIp)
+| eval process_name=mvindex(split(Image, "\\"), -1)
+| eval conn_time=strftime(_time, "%Y-%m-%d %H:%M:%S")
+| stats
+    count as connections
+    dc(DestinationIp) as unique_ips
+    values(DestinationIp) as dest_ips
+    latest(_time) as last_seen
+    by Computer, process_name, DestinationPort, User
+| eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+| eval risk=case(
+    DestinationPort IN (4444, 5555, 6666, 1234, 31337, 8888, 9999), "CRITICAL - Known C2 Port",
+    DestinationPort > 49152, "MEDIUM - Ephemeral Range",
+    connections > 50, "HIGH - High Frequency",
+    1=1, "LOW"
+    )
+| sort - connections
+| table Computer, process_name, User, DestinationPort, connections, unique_ips, dest_ips, last_seen, risk
+| rename Computer as "Host", process_name as "Process", User as "User", DestinationPort as "Dest Port", connections as "Connections", unique_ips as "Unique IPs", dest_ips as "Destination IPs", last_seen as "Last Seen", risk as "Risk"
+| head 50</query>
+          <earliest>$time_range.earliest$</earliest>
+          <latest>$time_range.latest$</latest>
+        </search>
+        <option name="count">20</option>
+        <option name="drilldown">row</option>
+        <option name="wrap">true</option>
+        <format type="color" field="Risk">
+          <colorPalette type="map">{"CRITICAL - Known C2 Port":#DC4E41,"HIGH - High Frequency":#F1813F,"MEDIUM - Ephemeral Range":#F8BE34,"LOW":#65A637}</colorPalette>
+        </format>
+      </table>
+    </panel>
+  </row>
+</dashboard>
