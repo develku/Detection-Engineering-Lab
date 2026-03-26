@@ -1,10 +1,35 @@
 # Detection Engineering Lab
 
-Detection rules, Sigma rules, dashboards, and alert tuning for a Splunk-based SIEM environment. 13 detection rules mapped to MITRE ATT&CK across 5 tactics, with vendor-neutral Sigma equivalents for SIEM portability.
+Three high-volume detection rules averaged a 6.5% true positive rate out of the box. Analysts would have investigated ~236 false alerts daily. After systematic tuning: 73-87% fewer false positives, zero true positives lost, and analyst triage time cut from ~20 hours/day to under 3 hours across the three rules.
 
-Built to work with the [SIEM-Detection-Lab](https://github.com/develku/SIEM-Detection-Lab) infrastructure and validated against [Attack-Simulation-Lab](https://github.com/develku/Attack-Simulation-Lab) scenarios.
+This repo contains 13 Splunk SPL detection rules mapped to MITRE ATT&CK across 5 tactics, vendor-neutral Sigma equivalents for any SIEM, 5 operational dashboards, and documented tuning reports with full before/after metrics.
+
+Built for the [SIEM-Detection-Lab](https://github.com/develku/SIEM-Detection-Lab) Splunk environment. Validated against [Attack-Simulation-Lab](https://github.com/develku/Attack-Simulation-Lab) adversary simulations.
+
+## What This Demonstrates
+
+- **87% fewer false positives** — LSASS access rule tuned from 47 alerts/day to 6, with TP rate rising from 8.5% to 66.7%
+- **Zero detection gaps** — every tuned rule re-validated against Atomic Red Team tests and manual evasion attempts
+- **~17 hours/day of analyst time recovered** — across three rules, by replacing noise with high-confidence alerts
+- **13 detections, any SIEM** — SPL for Splunk, Sigma YAML for Elasticsearch, Sentinel, or any platform sigma-cli supports
+
+## Alert Tuning Results
+
+Writing a detection rule is the first 50% — tuning it to work in a real environment is the other 50%. Untuned rules generate noise that analysts learn to ignore, and that is how real attacks get missed.
+
+| Rule | Alerts/Day | TP Rate | FP Reduction | Report |
+|---|---|---|---|---|
+| LSASS Access | 47 → 6 | 8.5% → 66.7% | -87% | [Report](tuning/lsass-access-tuning.md) |
+| Brute Force | 120 → 32 | 7.5% → 28.1% | -73% | [Report](tuning/brute-force-tuning.md) |
+| Service Creation | 85 → 12 | 3.5% → 25.0% | -86% | [Report](tuning/service-creation-tuning.md) |
+
+Each tuning report covers the full process: 7-day alert analysis, false positive source categorization, the tuned SPL query with rationale for every exclusion, attack simulation re-testing, and evasion testing to verify exclusions can't be bypassed.
+
+Methodology: [Tuning Methodology](docs/tuning-methodology.md)
 
 ## MITRE ATT&CK Coverage
+
+13 rules across 5 tactics:
 
 | Tactic | Technique | Rule | Severity | Log Source |
 |---|---|---|---|---|
@@ -22,9 +47,13 @@ Built to work with the [SIEM-Detection-Lab](https://github.com/develku/SIEM-Dete
 | **Defense Evasion** | T1070.001 | [Event Log Cleared](detections/defense-evasion/event-log-cleared.spl) | Critical | Security 1102 / System 104 |
 | | T1055 | [Process Injection](detections/defense-evasion/process-injection.spl) | High | Sysmon 8 |
 
-## Sigma Rules — SIEM Portability
+Every SPL file includes inline `# LEARNING:` comments explaining each query component — what it does, why it matters, and how attackers exploit the technique being detected.
 
-Every SPL detection has a matching [Sigma](https://sigmahq.io/) rule in YAML format, enabling conversion to any SIEM platform:
+Full rule documentation: [Detection Rules Guide](docs/detection-rules.md)
+
+## Sigma Rules
+
+Every SPL detection has a matching [Sigma](https://sigmahq.io/) rule in YAML format. Sigma is the vendor-neutral standard for detection rules — write once, convert to any SIEM:
 
 ```bash
 # Convert to Splunk SPL
@@ -57,22 +86,15 @@ sigma convert -t microsoft365defender sigma/credential-access/lsass-memory-dump.
 | [Persistence Mechanisms](dashboards/persistence-mechanisms.xml) | Registry modifications, new services, scheduled tasks |
 | [Alert Summary](dashboards/alert-summary.xml) | Aggregated alert view across all detection rules |
 
-## Alert Tuning
+## Prerequisites
 
-Writing a detection rule is the first 50% — the other 50% is tuning it to work in a real environment. Untuned rules averaged a 6.5% true positive rate across these three high-volume rules, meaning analysts investigated ~236 false alerts daily. After systematic tuning:
+- **Splunk** (or any SIEM via Sigma conversion)
+- **Sysmon** on endpoints with Event IDs 1 (process creation), 8 (CreateRemoteThread), 10 (ProcessAccess), and 13 (RegistryEvent) enabled
+- **Windows Security logs** forwarded to Splunk — Event IDs 1102, 4624, 4625, 4662, 4728, 4732, 4756
+- **Windows System logs** forwarded to Splunk — Event IDs 104, 7045
+- **[sigma-cli](https://github.com/SigmaHQ/sigma-cli)** (optional, for converting Sigma rules to non-Splunk SIEMs)
 
-| Rule | Alerts/Day | TP Rate | FP Reduction | Report |
-|---|---|---|---|---|
-| LSASS Access | 47 → 6 | 8.5% → 66.7% | -87% | [Report](tuning/lsass-access-tuning.md) |
-| Brute Force | 120 → 32 | 7.5% → 28.1% | -73% | [Report](tuning/brute-force-tuning.md) |
-| Service Creation | 85 → 12 | 3.5% → 25.0% | -86% | [Report](tuning/service-creation-tuning.md) |
-
-Methodology: [Tuning Methodology](docs/tuning-methodology.md)
-
-## Documentation
-
-- [Detection Rules Guide](docs/detection-rules.md) — rule logic, deployment, and usage
-- [Tuning Methodology](docs/tuning-methodology.md) — systematic approach to reducing false positives
+The [SIEM-Detection-Lab](https://github.com/develku/SIEM-Detection-Lab) covers the full Splunk deployment and log collection setup.
 
 ## Project Structure
 
@@ -92,7 +114,7 @@ Detection-Engineering-Lab/
 
 ## Related Projects
 
-This lab is part of a multi-project SOC environment:
+This repo is part of a multi-project SOC environment:
 
 | Project | Purpose |
 |---|---|

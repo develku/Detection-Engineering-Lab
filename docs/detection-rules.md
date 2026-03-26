@@ -1,6 +1,8 @@
 # Detection Rules
 
-This lab includes 13 detection rules mapped to MITRE ATT&CK, covering 5 tactics. Each rule exists in two formats: Splunk SPL (`.spl`) for direct use, and Sigma YAML (`.yml`) for SIEM portability.
+13 rules across 5 MITRE ATT&CK tactics, each in two formats: Splunk SPL (`.spl`) for direct deployment and Sigma YAML (`.yml`) for conversion to any SIEM.
+
+Every SPL file includes inline learning notes — line-by-line explanations of what the query does and why. Open any `.spl` file and look for `# LEARNING:` comments to see how each detection works at a technical level.
 
 ## Detection Coverage
 
@@ -15,13 +17,13 @@ This lab includes 13 detection rules mapped to MITRE ATT&CK, covering 5 tactics.
 │ Lateral Movement │ PsExec, RDP, WMI Remote Execution    │
 │ (3 rules)        │                                      │
 ├──────────────────┼──────────────────────────────────────┤
-│ Persistence      │ New Service, Registry Run Key         │
+│ Persistence      │ New Service, Registry Run Key        │
 │ (2 rules)        │                                      │
 ├──────────────────┼──────────────────────────────────────┤
-│ Priv Escalation  │ Admin Group Modification,             │
-│ (2 rules)        │ Scheduled Task Creation               │
+│ Priv Escalation  │ Admin Group Modification,            │
+│ (2 rules)        │ Scheduled Task Creation              │
 ├──────────────────┼──────────────────────────────────────┤
-│ Defense Evasion  │ Event Log Cleared, Process Injection  │
+│ Defense Evasion  │ Event Log Cleared, Process Injection │
 │ (2 rules)        │                                      │
 └──────────────────┴──────────────────────────────────────┘
 ```
@@ -98,25 +100,42 @@ sigma convert -t elasticsearch sigma/credential-access/lsass-memory-dump.yml
 
 ## How to Deploy
 
-### Quick Deploy — Copy/Paste
+These rules are designed for the [SIEM-Detection-Lab](https://github.com/develku/SIEM-Detection-Lab) Splunk environment but work in any Splunk instance with the right log sources.
+
+### Option 1: Copy/Paste
 
 1. Open a `.spl` file
-2. Copy the SPL query (skip comment lines)
+2. Copy the SPL query (skip the `#` comment lines)
 3. Paste into **Splunk Search & Reporting**
-4. Save as **Alert** with your desired trigger conditions
+4. Save as **Alert** with your trigger conditions (e.g., run every 5 minutes)
 
-### Saved Search — Automated
+Best for testing individual rules or one-off deployments.
 
-Import as saved searches via Splunk CLI:
+### Option 2: Splunk CLI
+
+Import as saved searches for scheduled execution:
 
 ```bash
-# Example: create a saved search from an .spl file
 /opt/splunk/bin/splunk add saved-search "LSASS Memory Dump" \
   -search "$(grep -v '^#' detections/credential-access/lsass-memory-dump.spl)" \
   -cron_schedule "*/5 * * * *" \
   -alert.severity 5
 ```
 
-## Tuning
+Best for deploying multiple rules at once or managing rules as code.
 
-Detection rules will generate false positives in any environment. See the [Tuning Methodology](tuning-methodology.md) guide and individual tuning reports in the [tuning/](../tuning/) directory for documented examples of how to reduce noise while maintaining detection capability.
+### Option 3: Sigma Conversion
+
+Convert to any SIEM using [sigma-cli](https://github.com/SigmaHQ/sigma-cli):
+
+```bash
+# Elasticsearch
+sigma convert -t elasticsearch sigma/credential-access/lsass-memory-dump.yml
+
+# Microsoft Sentinel (KQL)
+sigma convert -t microsoft365defender sigma/credential-access/lsass-memory-dump.yml
+```
+
+## After Deployment: Tuning
+
+Every rule will generate false positives in a real environment. The [Tuning Methodology](tuning-methodology.md) guide covers the systematic approach used in this lab, and each tuning report in [`tuning/`](../tuning/) shows the full before/after analysis with quantified results.
